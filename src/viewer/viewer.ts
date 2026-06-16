@@ -110,9 +110,7 @@ export class Viewer {
       );
       geometry.setAttribute("normal", new THREE.BufferAttribute(data.normals, 3));
       geometry.setIndex(new THREE.BufferAttribute(data.indices, 1));
-
-      // Матрица размещения из web-ifc — column-major, "запекаем" в вершины.
-      geometry.applyMatrix4(new THREE.Matrix4().fromArray(data.matrix));
+      // Позиции уже в мировых координатах IFC (матрица запечена в парсере).
 
       const material = new THREE.MeshLambertMaterial({
         color: new THREE.Color(data.color.r, data.color.g, data.color.b),

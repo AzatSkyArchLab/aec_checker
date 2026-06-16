@@ -41,6 +41,8 @@
             <button id="btn-isolate" class="tool-btn" title="Показать только выделенное (I)">Изолировать</button>
             <button id="btn-hide" class="tool-btn" title="Скрыть выделенное (H)">Скрыть</button>
             <button id="btn-showall" class="tool-btn" title="Показать всё (Esc)">Показать всё</button>
+            <span class="tool-sep"></span>
+            <button id="btn-map" class="tool-btn" title="Срез на уровне 0 → показать на карте">🗺 На карте</button>
           </div>
 
           <div id="dropzone" class="dropzone">
@@ -57,6 +59,19 @@
           <div id="properties" class="panel-body"></div>
         </aside>
       </main>
+    </div>
+
+    <div id="map-modal" class="map-modal" hidden>
+      <div class="map-dialog">
+        <div class="map-head">
+          <div class="map-titles">
+            <span class="map-title">Контур на карте — срез на уровне 0</span>
+            <span id="map-method" class="map-method"></span>
+          </div>
+          <button id="map-close" class="map-close" aria-label="Закрыть">✕</button>
+        </div>
+        <div id="map" class="map-canvas"></div>
+      </div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

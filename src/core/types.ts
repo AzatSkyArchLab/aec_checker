@@ -44,7 +44,11 @@ export interface IfcElementInfo {
   propertySets: IfcPropertySet[];
 }
 
-/** Геометрия одного размещённого меша — сырьё для three.js. */
+/**
+ * Геометрия одного размещённого меша — сырьё для three.js.
+ * Позиции уже в мировых координатах IFC, со снятым смещением модели (offset),
+ * чтобы числа были небольшими для float32. Матрица размещения запечена.
+ */
 export interface IfcMeshData {
   expressID: number;
   positions: Float32Array; // xyz, по 3 на вершину
@@ -52,6 +56,45 @@ export interface IfcMeshData {
   indices: Uint32Array;
   /** Цвет RGBA из IFC-материала, компоненты 0..1. */
   color: { r: number; g: number; b: number; a: number };
-  /** 4x4 матрица размещения (column-major, как у three.js). */
-  matrix: number[];
+}
+
+/** Смещение модели: мировая координата IFC = позиция_меша + offset. */
+export interface ModelOffset {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** Точка на плоскости (мировые координаты IFC, метры). */
+export type Point2 = [x: number, y: number];
+
+/** Гео-координата [широта, долгота] для Leaflet. */
+export type LatLng = [lat: number, lng: number];
+
+/**
+ * Привязка локальных координат IFC к WGS84: точка отсчёта + орты «восток/север»
+ * в локальной системе + масштаб. localToGeo считает тангенциальную проекцию.
+ */
+export interface GeoReference {
+  lat0: number;
+  lng0: number;
+  east: Point2; // единичный вектор «географический восток» в локальных XY
+  north: Point2; // единичный вектор «географический север» в локальных XY
+  scale: number;
+  /** Человекочитаемое описание метода привязки. */
+  method: string;
+}
+
+/** Результат среза модели на уровне 0: контуры в мировых координатах IFC. */
+export interface Footprint {
+  rings: Point2[][]; // замкнутые контуры
+  lines: Point2[][]; // незамкнутые отрезки/цепочки
+}
+
+/** Контур, спроецированный на карту (WGS84). */
+export interface GeoFootprint {
+  anchor: LatLng;
+  rings: LatLng[][];
+  lines: LatLng[][];
+  method: string;
 }

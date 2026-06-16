@@ -5,8 +5,15 @@ import type {
   IfcMeshData,
   IfcProperty,
   IfcPropertySet,
+  ModelOffset,
 } from "./types.ts";
 import { runChecks, type CheckResult } from "./checks/index.ts";
+import {
+  computeFootprint,
+  footprintToGeo,
+  getGeoReference,
+  type FootprintResult,
+} from "./geo.ts";
 
 /**
  * Тонкая модульная обёртка над web-ifc.
@@ -18,6 +25,11 @@ export class IfcParser {
   private api: IfcAPI;
   private modelID = -1;
   private ready = false;
+
+  /** Смещение модели: мировая координата IFC = позиция_меша + offset. */
+  private offset: ModelOffset = { x: 0, y: 0, z: 0 };
+  /** Последняя построенная геометрия (для среза по Z=0). */
+  private meshes: IfcMeshData[] = [];
 
   constructor() {
     this.api = new IfcAPI();
@@ -36,9 +48,11 @@ export class IfcParser {
   async open(data: Uint8Array): Promise<void> {
     await this.init();
     this.close();
-    // COORDINATE_TO_ORIGIN: центрируем геореференс-модели у начала координат,
-    // иначе огромные координаты дают артефакты точности float32 в three.js.
-    this.modelID = this.api.OpenModel(data, { COORDINATE_TO_ORIGIN: true });
+    // БЕЗ COORDINATE_TO_ORIGIN: рецентрируем сами (getMeshes), чтобы знать offset
+    // и корректно резать на исходном уровне Z=0 + привязывать к координатам.
+    this.modelID = this.api.OpenModel(data);
+    this.offset = { x: 0, y: 0, z: 0 };
+    this.meshes = [];
   }
 
   /** Закрывает текущую модель и освобождает память. */
@@ -228,12 +242,17 @@ export class IfcParser {
   // ── Геометрия ──────────────────────────────────────────────────────────────
 
   /**
-   * Извлекает всю геометрию модели в нейтральном виде для three.js.
-   * Вершины де-интерливятся: web-ifc отдаёт [x,y,z, nx,ny,nz] на вершину.
+   * Извлекает всю геометрию в мировых координатах IFC. Матрица размещения
+   * запекается в вершины (float64), затем вычитается центр bbox (offset) —
+   * так числа малы для float32, а offset позволяет вернуться к мировым координатам.
+   * Вершины web-ifc де-интерливятся: [x,y,z, nx,ny,nz] на вершину.
    */
   getMeshes(): IfcMeshData[] {
     this.assertOpen();
     const meshes: IfcMeshData[] = [];
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
     this.api.StreamAllMeshes(this.modelID, (mesh) => {
       const placed = mesh.geometries;
       for (let i = 0; i < placed.size(); i++) {
@@ -247,17 +266,31 @@ export class IfcParser {
           geom.GetIndexData(),
           geom.GetIndexDataSize(),
         );
+        const m = pg.flatTransformation; // 4x4 column-major
 
         const vertexCount = verts.length / 6;
         const positions = new Float32Array(vertexCount * 3);
         const normals = new Float32Array(vertexCount * 3);
         for (let v = 0; v < vertexCount; v++) {
-          positions[v * 3] = verts[v * 6];
-          positions[v * 3 + 1] = verts[v * 6 + 1];
-          positions[v * 3 + 2] = verts[v * 6 + 2];
-          normals[v * 3] = verts[v * 6 + 3];
-          normals[v * 3 + 1] = verts[v * 6 + 4];
-          normals[v * 3 + 2] = verts[v * 6 + 5];
+          const lx = verts[v * 6], ly = verts[v * 6 + 1], lz = verts[v * 6 + 2];
+          const nx = verts[v * 6 + 3], ny = verts[v * 6 + 4], nz = verts[v * 6 + 5];
+          // Мировые координаты (float64): применяем матрицу размещения.
+          const wx = m[0] * lx + m[4] * ly + m[8] * lz + m[12];
+          const wy = m[1] * lx + m[5] * ly + m[9] * lz + m[13];
+          const wz = m[2] * lx + m[6] * ly + m[10] * lz + m[14];
+          positions[v * 3] = wx;
+          positions[v * 3 + 1] = wy;
+          positions[v * 3 + 2] = wz;
+          // Нормали: только вращение (placement IFC жёсткий).
+          normals[v * 3] = m[0] * nx + m[4] * ny + m[8] * nz;
+          normals[v * 3 + 1] = m[1] * nx + m[5] * ny + m[9] * nz;
+          normals[v * 3 + 2] = m[2] * nx + m[6] * ny + m[10] * nz;
+          if (wx < minX) minX = wx;
+          if (wy < minY) minY = wy;
+          if (wz < minZ) minZ = wz;
+          if (wx > maxX) maxX = wx;
+          if (wy > maxY) maxY = wy;
+          if (wz > maxZ) maxZ = wz;
         }
 
         meshes.push({
@@ -266,11 +299,52 @@ export class IfcParser {
           normals,
           indices: new Uint32Array(indices),
           color: { r: pg.color.x, g: pg.color.y, b: pg.color.z, a: pg.color.w },
-          matrix: Array.from(pg.flatTransformation),
         });
       }
     });
+
+    // Центр bbox → offset; вычитаем из всех позиций (рецентрирование).
+    this.offset = meshes.length
+      ? { x: (minX + maxX) / 2, y: (minY + maxY) / 2, z: (minZ + maxZ) / 2 }
+      : { x: 0, y: 0, z: 0 };
+    for (const m of meshes) {
+      for (let i = 0; i < m.positions.length; i += 3) {
+        m.positions[i] -= this.offset.x;
+        m.positions[i + 1] -= this.offset.y;
+        m.positions[i + 2] -= this.offset.z;
+      }
+    }
+    this.meshes = meshes;
     return meshes;
+  }
+
+  /** Смещение модели: мировая координата IFC = позиция_меша + offset. */
+  getModelOffset(): ModelOffset {
+    return this.offset;
+  }
+
+  // ── Гео: срез на уровне 0 + привязка к карте ──────────────────────────────────
+
+  /**
+   * Делает горизонтальный срез на уровне Z=0 и проецирует контур на карту,
+   * если у модели есть геопривязка. Геометрия должна быть уже построена (getMeshes).
+   */
+  async getFootprintGeo(): Promise<FootprintResult> {
+    this.assertOpen();
+    if (this.meshes.length === 0) {
+      return { ok: false, reason: "Геометрия не построена" };
+    }
+    const refRes = await getGeoReference(this.api, this.modelID);
+    if (!refRes.ok) return refRes;
+
+    const footprint = computeFootprint(this.meshes, this.offset);
+    if (footprint.rings.length === 0 && footprint.lines.length === 0) {
+      return {
+        ok: false,
+        reason: "Срез на уровне 0 пуст — на этой высоте нет геометрии",
+      };
+    }
+    return { ok: true, footprint: footprintToGeo(footprint, refRes.ref) };
   }
 
   // ── Утилиты ──────────────────────────────────────────────────────────────

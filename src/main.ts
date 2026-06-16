@@ -4,6 +4,7 @@ import { Viewer } from "./viewer/viewer.ts";
 import { ElementList } from "./ui/element-list.ts";
 import { PropertiesPanel } from "./ui/properties-panel.ts";
 import { ChecksPanel } from "./ui/checks-panel.ts";
+import { MapView } from "./ui/map-view.ts";
 
 /**
  * Точка входа: связывает ядро (IfcParser), 3D-вьювер и UI-панели.
@@ -22,6 +23,12 @@ const viewer = new Viewer($("#viewer"));
 const elementList = new ElementList($("#element-list"));
 const propertiesPanel = new PropertiesPanel($("#properties"));
 const checksPanel = new ChecksPanel($("#checks"));
+const mapView = new MapView(
+  $("#map-modal"),
+  $("#map"),
+  $("#map-method"),
+  $("#map-close"),
+);
 
 const statusEl = $<HTMLElement>("#status");
 const dropzone = $<HTMLElement>("#dropzone");
@@ -94,6 +101,10 @@ const selCountEl = $<HTMLElement>("#sel-count");
 const btnIsolate = $<HTMLButtonElement>("#btn-isolate");
 const btnHide = $<HTMLButtonElement>("#btn-hide");
 const btnShowAll = $<HTMLButtonElement>("#btn-showall");
+const btnMap = $<HTMLButtonElement>("#btn-map");
+
+/** Есть ли у модели геопривязка (определяется при загрузке по проверке). */
+let hasGeoReference = false;
 
 function updateToolbar(): void {
   const n = selection.size;
@@ -101,6 +112,25 @@ function updateToolbar(): void {
   btnIsolate.disabled = n === 0;
   btnHide.disabled = n === 0;
   btnShowAll.disabled = !viewer.hasHidden();
+  btnMap.disabled = !hasGeoReference;
+}
+
+btnMap.addEventListener("click", () => void showOnMap());
+
+async function showOnMap(): Promise<void> {
+  setStatus("Срез на уровне 0…");
+  try {
+    const result = await parser.getFootprintGeo();
+    if (!result.ok) {
+      setStatus(`Карта: ${result.reason}`);
+      return;
+    }
+    await mapView.show(result.footprint);
+    setStatus(`Карта: ${result.footprint.method}`);
+  } catch (err) {
+    console.error(err);
+    setStatus("Карта: ошибка построения контура");
+  }
 }
 
 function isolateSelected(): void {
@@ -151,6 +181,7 @@ async function loadFile(file: File): Promise<void> {
   checksPanel.clear();
   selection.clear();
   lastSelected = null;
+  hasGeoReference = false;
   try {
     const buffer = new Uint8Array(await file.arrayBuffer());
 
@@ -167,6 +198,10 @@ async function loadFile(file: File): Promise<void> {
     setStatus("Проверки модели…");
     const checks = await parser.runChecks();
     checksPanel.show(checks);
+
+    // Кнопка карты активна, если проверка геопривязки нашла хоть какой-то признак.
+    const geoCheck = checks.find((c) => c.id === "georeferencing");
+    hasGeoReference = geoCheck != null && geoCheck.status !== "fail";
 
     toolbar.hidden = false;
     updateToolbar();
