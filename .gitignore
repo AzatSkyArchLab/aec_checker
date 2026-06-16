@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+
+# WASM копируется из node_modules скриптом copy-wasm (postinstall) — не коммитим
+public/web-ifc.wasm
+
+# Логи
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Редакторы
+.vscode/*
+!.vscode/extensions.json
+.idea/
