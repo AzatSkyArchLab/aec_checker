@@ -27,6 +27,7 @@ const mapView = new MapView(
   $("#map-modal"),
   $("#map"),
   $("#map-method"),
+  $("#map-message"),
   $("#map-close"),
 );
 
@@ -103,8 +104,8 @@ const btnHide = $<HTMLButtonElement>("#btn-hide");
 const btnShowAll = $<HTMLButtonElement>("#btn-showall");
 const btnMap = $<HTMLButtonElement>("#btn-map");
 
-/** Есть ли у модели геопривязка (определяется при загрузке по проверке). */
-let hasGeoReference = false;
+/** Загружена ли геометрия (для активации кнопки карты). */
+let hasGeometry = false;
 
 function updateToolbar(): void {
   const n = selection.size;
@@ -112,7 +113,7 @@ function updateToolbar(): void {
   btnIsolate.disabled = n === 0;
   btnHide.disabled = n === 0;
   btnShowAll.disabled = !viewer.hasHidden();
-  btnMap.disabled = !hasGeoReference;
+  btnMap.disabled = !hasGeometry;
 }
 
 btnMap.addEventListener("click", () => void showOnMap());
@@ -122,6 +123,8 @@ async function showOnMap(): Promise<void> {
   try {
     const result = await parser.getFootprintGeo();
     if (!result.ok) {
+      // Модалка всё равно открывается — с понятной причиной, а не молча.
+      mapView.showMessage(result.reason);
       setStatus(`Карта: ${result.reason}`);
       return;
     }
@@ -129,6 +132,7 @@ async function showOnMap(): Promise<void> {
     setStatus(`Карта: ${result.footprint.method}`);
   } catch (err) {
     console.error(err);
+    mapView.showMessage(`Ошибка построения контура: ${(err as Error).message}`);
     setStatus("Карта: ошибка построения контура");
   }
 }
@@ -181,7 +185,7 @@ async function loadFile(file: File): Promise<void> {
   checksPanel.clear();
   selection.clear();
   lastSelected = null;
-  hasGeoReference = false;
+  hasGeometry = false;
   try {
     const buffer = new Uint8Array(await file.arrayBuffer());
 
@@ -194,14 +198,11 @@ async function loadFile(file: File): Promise<void> {
     setStatus("Построение геометрии…");
     const meshes = parser.getMeshes();
     viewer.loadMeshes(meshes);
+    hasGeometry = meshes.length > 0;
 
     setStatus("Проверки модели…");
     const checks = await parser.runChecks();
     checksPanel.show(checks);
-
-    // Кнопка карты активна, если проверка геопривязки нашла хоть какой-то признак.
-    const geoCheck = checks.find((c) => c.id === "georeferencing");
-    hasGeoReference = geoCheck != null && geoCheck.status !== "fail";
 
     toolbar.hidden = false;
     updateToolbar();

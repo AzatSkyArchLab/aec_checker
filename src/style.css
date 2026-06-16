@@ -441,10 +441,31 @@ body {
 .map-close:hover {
   border-color: var(--accent);
 }
-.map-canvas {
+.map-body {
+  position: relative;
   flex: 1 1 auto;
   min-height: 0;
+}
+.map-canvas {
+  position: absolute;
+  inset: 0;
   background: #aad3df; /* вода OSM, пока тайлы грузятся */
+}
+.map-message {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 32px;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1.5;
+  background: var(--bg-panel);
+}
+.map-message[hidden] {
+  display: none;
 }
 /* Leaflet-контролы в тёмной теме читаемее на светлой карте — оставляем дефолт. */
 .leaflet-container {

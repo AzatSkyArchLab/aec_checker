@@ -17,6 +17,7 @@ export class MapView {
     private modal: HTMLElement,
     private mapEl: HTMLElement,
     private methodEl: HTMLElement,
+    private messageEl: HTMLElement,
     closeBtn: HTMLElement,
   ) {
     closeBtn.addEventListener("click", () => this.hide());
@@ -28,8 +29,19 @@ export class MapView {
     });
   }
 
+  /** Открывает модалку с сообщением вместо карты (нет привязки / пустой срез). */
+  showMessage(text: string): void {
+    this.modal.hidden = false;
+    this.methodEl.textContent = "";
+    this.mapEl.style.visibility = "hidden";
+    this.messageEl.hidden = false;
+    this.messageEl.textContent = text;
+  }
+
   async show(footprint: GeoFootprint): Promise<void> {
     this.modal.hidden = false;
+    this.messageEl.hidden = true;
+    this.mapEl.style.visibility = "visible";
     await this.ensureMap();
     const L = this.L;
 
