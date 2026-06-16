@@ -4,9 +4,11 @@ import { computeFootprint, getGeoReference, footprintToGeo } from "../src/core/g
 
 const api = new IfcAPI();
 await api.Init();
+const fixture = process.argv[2] ?? "georef.ifc";
 const data = new Uint8Array(
-  readFileSync(new URL("../samples/georef.ifc", import.meta.url)),
+  readFileSync(new URL(`../samples/${fixture}`, import.meta.url)),
 );
+console.log("fixture:", fixture);
 const modelID = api.OpenModel(data); // без COORDINATE_TO_ORIGIN, как в парсере
 
 const meshes: any[] = [];

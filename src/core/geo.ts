@@ -133,9 +133,11 @@ export function computeFootprint(
       if (y > maxY) maxY = y;
     }
   }
-  const eps = Math.max((maxY - minY) * 1e-3, 1e-3);
-  // Мировой уровень 0 в координатах мешей = -offset.y; берём чуть выше базы.
-  const sliceY = -offset.y + eps;
+  // «Уровень 0» = основание модели, а не абсолютный мировой Z=0: многие модели
+  // подняты на высоту площадки/этажа, и срез по мировому 0 был бы пустым.
+  // Режем чуть выше самой нижней точки, чтобы пройти сквозь стены первого этажа.
+  const lift = Math.max((maxY - minY) * 0.01, 0.02);
+  const sliceY = minY + lift;
 
   const rings: Point2[][] = [];
   const lines: Point2[][] = [];
