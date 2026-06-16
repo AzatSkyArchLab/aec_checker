@@ -6,6 +6,7 @@ import type {
   IfcProperty,
   IfcPropertySet,
 } from "./types.ts";
+import { runChecks, type CheckResult } from "./checks/index.ts";
 
 /**
  * Тонкая модульная обёртка над web-ifc.
@@ -66,6 +67,14 @@ export class IfcParser {
       out.push(this.toElement(id));
     }
     return out;
+  }
+
+  // ── Проверки модели ─────────────────────────────────────────────────────────
+
+  /** Прогоняет все зарегистрированные проверки (геопривязка и т.д.). */
+  async runChecks(): Promise<CheckResult[]> {
+    this.assertOpen();
+    return runChecks({ api: this.api, modelID: this.modelID });
   }
 
   private toElement(expressID: number): IfcElement {

@@ -3,6 +3,7 @@ import { IfcParser } from "./core/ifc-parser.ts";
 import { Viewer } from "./viewer/viewer.ts";
 import { ElementList } from "./ui/element-list.ts";
 import { PropertiesPanel } from "./ui/properties-panel.ts";
+import { ChecksPanel } from "./ui/checks-panel.ts";
 
 /**
  * Точка входа: связывает ядро (IfcParser), 3D-вьювер и UI-панели.
@@ -20,6 +21,7 @@ const parser = new IfcParser();
 const viewer = new Viewer($("#viewer"));
 const elementList = new ElementList($("#element-list"));
 const propertiesPanel = new PropertiesPanel($("#properties"));
+const checksPanel = new ChecksPanel($("#checks"));
 
 const statusEl = $<HTMLElement>("#status");
 const dropzone = $<HTMLElement>("#dropzone");
@@ -53,6 +55,7 @@ async function selectElement(expressID: number | null): Promise<void> {
 
 elementList.setSelectHandler((id) => void selectElement(id));
 viewer.setSelectHandler((id) => void selectElement(id));
+checksPanel.setSelectHandler((id) => void selectElement(id));
 
 // ── Загрузка файла ───────────────────────────────────────────────────────────
 
@@ -60,6 +63,7 @@ async function loadFile(file: File): Promise<void> {
   setStatus(`Чтение «${file.name}»…`);
   dropzone.classList.add("hidden");
   propertiesPanel.clear();
+  checksPanel.clear();
   try {
     const buffer = new Uint8Array(await file.arrayBuffer());
 
@@ -72,6 +76,10 @@ async function loadFile(file: File): Promise<void> {
     setStatus("Построение геометрии…");
     const meshes = parser.getMeshes();
     viewer.loadMeshes(meshes);
+
+    setStatus("Проверки модели…");
+    const checks = await parser.runChecks();
+    checksPanel.show(checks);
 
     setStatus(`${file.name} · ${elements.length} элементов`);
   } catch (err) {
