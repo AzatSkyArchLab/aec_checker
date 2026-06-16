@@ -1,15 +1,18 @@
 import type { IfcElement } from "../core/types.ts";
 
-export type ElementSelectHandler = (expressID: number) => void;
+/** additive === true — клик с Shift (мультивыбор). */
+export type ElementSelectHandler = (expressID: number, additive: boolean) => void;
 
 /**
  * Левая панель: элементы модели, сгруппированные по типу IFC.
- * Поддерживает фильтрацию по тексту и подсветку активного элемента.
+ * Поддерживает фильтрацию, мультивыбор (подсветку нескольких) и затемнение
+ * скрытых элементов.
  */
 export class ElementList {
   private elements: IfcElement[] = [];
   private filter = "";
-  private activeID: number | null = null;
+  private selected = new Set<number>();
+  private hidden = new Set<number>();
   private onSelect: ElementSelectHandler = () => {};
 
   constructor(private root: HTMLElement) {}
@@ -20,6 +23,8 @@ export class ElementList {
 
   setElements(elements: IfcElement[]): void {
     this.elements = elements;
+    this.selected.clear();
+    this.hidden.clear();
     this.render();
   }
 
@@ -28,16 +33,27 @@ export class ElementList {
     this.render();
   }
 
-  /** Подсветить активный элемент (например, при выборе в 3D). */
-  setActive(expressID: number | null): void {
-    this.activeID = expressID;
-    const prev = this.root.querySelector(".item.active");
-    prev?.classList.remove("active");
-    if (expressID == null) return;
-    const el = this.root.querySelector(`.item[data-id="${expressID}"]`);
-    if (el) {
-      el.classList.add("active");
-      el.scrollIntoView({ block: "nearest" });
+  /** Подсветить выделенные элементы (мультивыбор). Последний — проскроллить. */
+  setSelection(ids: number[]): void {
+    this.selected = new Set(ids);
+    for (const el of this.root.querySelectorAll(".item")) {
+      const id = Number((el as HTMLElement).dataset.id);
+      el.classList.toggle("active", this.selected.has(id));
+    }
+    const last = ids[ids.length - 1];
+    if (last != null) {
+      this.root
+        .querySelector(`.item[data-id="${last}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  /** Затемнить скрытые в сцене элементы. */
+  setHidden(ids: number[]): void {
+    this.hidden = new Set(ids);
+    for (const el of this.root.querySelectorAll(".item")) {
+      const id = Number((el as HTMLElement).dataset.id);
+      el.classList.toggle("hidden-item", this.hidden.has(id));
     }
   }
 
@@ -86,10 +102,14 @@ export class ElementList {
         const item = document.createElement("div");
         item.className = "item";
         item.dataset.id = String(e.expressID);
-        if (e.expressID === this.activeID) item.classList.add("active");
+        if (this.selected.has(e.expressID)) item.classList.add("active");
+        if (this.hidden.has(e.expressID)) item.classList.add("hidden-item");
         const label = e.name ?? `#${e.expressID}`;
         item.innerHTML = `<span class="name">${escapeHtml(label)}</span><span class="eid">#${e.expressID}</span>`;
-        item.addEventListener("click", () => this.onSelect(e.expressID));
+        // Shift+клик — мультивыбор; обычный клик — одиночный.
+        item.addEventListener("click", (ev) =>
+          this.onSelect(e.expressID, ev.shiftKey),
+        );
         group.appendChild(item);
       }
       this.root.appendChild(group);

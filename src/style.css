@@ -207,6 +207,10 @@ body {
   background: var(--accent-dim);
   box-shadow: inset 2px 0 0 var(--accent);
 }
+.item.hidden-item .name {
+  opacity: 0.4;
+  font-style: italic;
+}
 .item .name {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -333,6 +337,45 @@ body {
 }
 .viewer canvas {
   display: block;
+}
+
+/* ── Тулбар видимости (поверх вьюпорта) ─────────────────── */
+.view-toolbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(30, 31, 35, 0.88);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+  z-index: 5;
+}
+.sel-count {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 0 8px 0 4px;
+  white-space: nowrap;
+}
+.tool-btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tool-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.tool-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .dropzone {
