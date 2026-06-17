@@ -49,37 +49,53 @@ export class MapView {
     this.layer.clearLayers();
 
     const bounds = L.latLngBounds([]);
-    const extend = (pts: LatLng[]) => pts.forEach((p) => bounds.extend(p));
+    let sumLat = 0;
+    let sumLng = 0;
+    let count = 0;
+    const draw = (pts: LatLng[], closed: boolean) => {
+      const clean = pts.filter(isValidLatLng);
+      if (clean.length < 2) return;
+      const shape = closed
+        ? L.polygon(clean, { color: FOOTPRINT_COLOR, weight: 3, fillOpacity: 0.3 })
+        : L.polyline(clean, { color: FOOTPRINT_COLOR, weight: 3 });
+      shape.addTo(this.layer);
+      for (const p of clean) {
+        bounds.extend(p);
+        sumLat += p[0];
+        sumLng += p[1];
+        count++;
+      }
+    };
 
-    for (const ring of footprint.rings) {
-      L.polygon(ring, {
-        color: FOOTPRINT_COLOR,
-        weight: 2,
-        fillOpacity: 0.25,
-      }).addTo(this.layer);
-      extend(ring);
-    }
-    for (const line of footprint.lines) {
-      L.polyline(line, { color: FOOTPRINT_COLOR, weight: 2 }).addTo(this.layer);
-      extend(line);
+    for (const ring of footprint.rings) draw(ring, true);
+    for (const line of footprint.lines) draw(line, false);
+
+    if (count === 0) {
+      // Контур есть, но координаты привязки невалидны — честно сообщаем.
+      this.showMessage(
+        "Контур получен, но координаты привязки некорректны — не удаётся разместить на карте.",
+      );
+      return;
     }
 
-    L.circleMarker(footprint.anchor, {
-      radius: 5,
+    // Заметный маркер на центре контура — чтобы объект было видно где угодно.
+    const center: LatLng = [sumLat / count, sumLng / count];
+    L.circleMarker(center, {
+      radius: 8,
       color: "#ffffff",
       weight: 2,
       fillColor: FOOTPRINT_COLOR,
       fillOpacity: 1,
     })
       .addTo(this.layer)
-      .bindTooltip("Точка отсчёта");
-    bounds.extend(footprint.anchor);
+      .bindTooltip("Объект (срез у основания)", { permanent: true, direction: "top" });
 
     // Карта внутри только что показанной модалки — нужно пересчитать размер.
     const fit = () => {
       this.map.invalidateSize();
-      if (bounds.isValid()) this.map.fitBounds(bounds, { padding: [40, 40], maxZoom: 21 });
-      else this.map.setView(footprint.anchor, 18);
+      if (bounds.isValid())
+        this.map.fitBounds(bounds, { padding: [50, 50], maxZoom: 20 });
+      else this.map.setView(center, 18);
     };
     fit();
     setTimeout(fit, 80);
@@ -103,4 +119,13 @@ export class MapView {
     }).addTo(this.map);
     this.layer = L.layerGroup().addTo(this.map);
   }
+}
+
+function isValidLatLng(p: LatLng): boolean {
+  return (
+    Number.isFinite(p[0]) &&
+    Number.isFinite(p[1]) &&
+    Math.abs(p[0]) <= 90 &&
+    Math.abs(p[1]) <= 180
+  );
 }
