@@ -1,17 +1,29 @@
-import type { CheckResult } from "../core/checks/index.ts";
+import type { CheckOutcome, CheckStatus } from "../core/checks/index.ts";
 
 export type CheckSelectHandler = (expressID: number) => void;
 
-const STATUS_LABEL: Record<CheckResult["status"], string> = {
+const STATUS_LABEL: Record<CheckStatus, string> = {
   pass: "OK",
   warn: "частично",
-  fail: "не найдено",
-  info: "—",
+  fail: "не пройдена",
+  info: "ошибка",
+  todo: "не реализовано",
+  manual: "ручная",
+};
+
+/** Вес для выбора «худшего» статуса категории. */
+const STATUS_RANK: Record<CheckStatus, number> = {
+  fail: 5,
+  warn: 4,
+  pass: 3,
+  info: 2,
+  manual: 1,
+  todo: 0,
 };
 
 /**
- * Блок «Проверки модели» в левой панели. Показывает результат каждой проверки
- * со статусом и раскрывающимся списком находок. Находки с expressID кликабельны.
+ * Каталог проверок ЦИМ АГР в левой панели: группировка по категориям,
+ * статус каждой проверки, раскрытие алгоритма/источника/находок.
  */
 export class ChecksPanel {
   private onSelect: CheckSelectHandler = () => {};
@@ -28,40 +40,94 @@ export class ChecksPanel {
     this.root.innerHTML = "";
   }
 
-  show(results: CheckResult[]): void {
+  show(outcomes: CheckOutcome[]): void {
     this.root.innerHTML = "";
-    if (results.length === 0) return;
+    if (outcomes.length === 0) return;
 
-    const header = document.createElement("div");
-    header.className = "checks-header";
-    header.textContent = "Проверки модели";
-    this.root.appendChild(header);
+    this.root.appendChild(this.renderHeader(outcomes));
 
-    for (const r of results) this.root.appendChild(this.renderCheck(r));
+    // Группировка по категориям с сохранением порядка каталога.
+    const byCat = new Map<string, CheckOutcome[]>();
+    for (const o of outcomes) {
+      const arr = byCat.get(o.spec.category) ?? [];
+      arr.push(o);
+      byCat.set(o.spec.category, arr);
+    }
+    for (const [category, items] of byCat) {
+      this.root.appendChild(this.renderCategory(category, items));
+    }
   }
 
-  private renderCheck(r: CheckResult): HTMLElement {
-    const block = document.createElement("details");
-    block.className = "check";
-    block.open = r.findings.length > 0;
+  private renderHeader(outcomes: CheckOutcome[]): HTMLElement {
+    const counts = { pass: 0, warn: 0, fail: 0, info: 0, todo: 0, manual: 0 };
+    for (const o of outcomes) counts[o.status]++;
+    const header = document.createElement("div");
+    header.className = "checks-header";
+    header.innerHTML = `
+      <div class="checks-title">Проверки ЦИМ АГР · ${outcomes.length}</div>
+      <div class="checks-counts">
+        <span class="status-pass">✓ ${counts.pass}</span>
+        <span class="status-warn">⚠ ${counts.warn}</span>
+        <span class="status-fail">✗ ${counts.fail}</span>
+        <span class="status-manual">ручных ${counts.manual}</span>
+        <span class="status-todo">todo ${counts.todo}</span>
+      </div>`;
+    return header;
+  }
+
+  private renderCategory(category: string, items: CheckOutcome[]): HTMLElement {
+    const worst = items.reduce<CheckStatus>(
+      (acc, o) => (STATUS_RANK[o.status] > STATUS_RANK[acc] ? o.status : acc),
+      "todo",
+    );
+    const group = document.createElement("details");
+    group.className = "check-cat";
+    // Категорию с проблемами (fail/warn) раскрываем сразу.
+    group.open = worst === "fail" || worst === "warn";
 
     const summary = document.createElement("summary");
     summary.innerHTML = `
-      <span class="check-dot status-${r.status}" title="${STATUS_LABEL[r.status]}"></span>
-      <span class="check-title">${escapeHtml(r.title)}</span>
-      <span class="check-status status-${r.status}">${STATUS_LABEL[r.status]}</span>
-    `;
+      <span class="check-dot status-${worst}"></span>
+      <span class="cat-name">${escapeHtml(category)}</span>
+      <span class="cat-count">${items.length}</span>`;
+    group.appendChild(summary);
+
+    for (const o of items) group.appendChild(this.renderCheck(o));
+    return group;
+  }
+
+  private renderCheck(o: CheckOutcome): HTMLElement {
+    const block = document.createElement("details");
+    block.className = "check";
+
+    const summary = document.createElement("summary");
+    summary.innerHTML = `
+      <span class="check-dot status-${o.status}" title="${STATUS_LABEL[o.status]}"></span>
+      <span class="check-id">${o.spec.id}</span>
+      <span class="check-title">${escapeHtml(o.spec.name)}</span>
+      <span class="check-status status-${o.status}">${STATUS_LABEL[o.status]}</span>`;
     block.appendChild(summary);
 
     const body = document.createElement("div");
     body.className = "check-body";
 
-    const summaryLine = document.createElement("div");
-    summaryLine.className = "check-summary";
-    summaryLine.textContent = r.summary;
-    body.appendChild(summaryLine);
+    if (o.summary) {
+      const s = document.createElement("div");
+      s.className = "check-summary";
+      s.textContent = o.summary;
+      body.appendChild(s);
+    }
 
-    for (const f of r.findings) {
+    const meta = document.createElement("div");
+    meta.className = "check-meta";
+    meta.innerHTML = `
+      <div class="check-algo">${escapeHtml(o.spec.algorithm)}</div>
+      <div class="check-source">${escapeHtml(o.spec.source)} · приоритет ${escapeHtml(
+        o.spec.priority,
+      )} · автоматизация: ${escapeHtml(o.spec.automatable)}</div>`;
+    body.appendChild(meta);
+
+    for (const f of o.findings) {
       const row = document.createElement("div");
       row.className = "finding";
       const idChip =
@@ -71,8 +137,7 @@ export class ChecksPanel {
       row.innerHTML = `
         <span class="finding-label">${escapeHtml(f.label)}</span>
         ${f.detail ? `<span class="finding-detail">${escapeHtml(f.detail)}</span>` : ""}
-        ${idChip}
-      `;
+        ${idChip}`;
       const chip = row.querySelector<HTMLElement>(".finding-id");
       if (chip && f.expressID != null) {
         chip.addEventListener("click", () => this.onSelect(f.expressID!));

@@ -6,6 +6,10 @@ dist/
 # WASM копируется из node_modules скриптом copy-wasm (postinstall) — не коммитим
 public/web-ifc.wasm
 
+# ПРИВАТНЫЙ каталог проверок ЦИМ АГР (алгоритмы + НПА) — генерируется из xlsx,
+# в публичный репозиторий не попадает (только движок). См. scripts/gen-catalog.py
+public/checks-catalog.json
+
 # Логи
 npm-debug.log*
 yarn-debug.log*

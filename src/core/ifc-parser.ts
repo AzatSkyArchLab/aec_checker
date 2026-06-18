@@ -7,7 +7,7 @@ import type {
   IfcPropertySet,
   ModelOffset,
 } from "./types.ts";
-import { runChecks, type CheckResult } from "./checks/index.ts";
+import { runChecks, type CheckOutcome } from "./checks/index.ts";
 import {
   computeFootprint,
   footprintToGeo,
@@ -85,8 +85,8 @@ export class IfcParser {
 
   // ── Проверки модели ─────────────────────────────────────────────────────────
 
-  /** Прогоняет все зарегистрированные проверки (геопривязка и т.д.). */
-  async runChecks(): Promise<CheckResult[]> {
+  /** Прогоняет весь каталог проверок ЦИМ АГР по модели. */
+  async runChecks(): Promise<CheckOutcome[]> {
     this.assertOpen();
     return runChecks({ api: this.api, modelID: this.modelID });
   }

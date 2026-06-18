@@ -1,7 +1,12 @@
 import type { IfcAPI } from "web-ifc";
 
-/** Итоговый статус проверки. */
-export type CheckStatus = "pass" | "warn" | "fail" | "info";
+/**
+ * Статус проверки:
+ *  pass/warn/fail/info — результат выполненной авто-проверки;
+ *  todo — авто-проверка ещё не реализована;
+ *  manual — требует ручной/внешней проверки (УКЭП, BCF, коллизии и т.п.).
+ */
+export type CheckStatus = "pass" | "warn" | "fail" | "info" | "todo" | "manual";
 
 /** Один найденный сигнал внутри проверки. */
 export interface CheckFinding {
@@ -13,27 +18,45 @@ export interface CheckFinding {
   expressID?: number;
 }
 
-/** Результат одной проверки модели. */
-export interface CheckResult {
+/** Описание проверки из реестра ЦИМ АГР (метаданные, без логики). */
+export interface CheckSpec {
   id: string;
-  title: string;
-  status: CheckStatus;
-  /** Короткий вывод (что в целом нашли / не нашли). */
-  summary: string;
-  findings: CheckFinding[];
+  category: string;
+  name: string;
+  /** Источник — пункт НПА. */
+  source: string;
+  /** Текст алгоритма проверки из реестра. */
+  algorithm: string;
+  priority: string; // High | Med | Low
+  complexity: string; // Low | Med | High
+  automatable: string; // Да | Частично
+  /** Можем ли выполнить в этом инструменте: auto — реализуемо, manual — вручную. */
+  mode: "auto" | "manual";
 }
 
-/** Контекст, который получает проверка. Проверки специфичны для IFC,
- *  поэтому им даётся прямой доступ к web-ifc. */
+/** Контекст, который получает проверка (прямой доступ к web-ifc). */
 export interface CheckContext {
   api: IfcAPI;
   modelID: number;
 }
 
-/** Модуль-проверка. Добавление новой = реализовать этот интерфейс и
- *  зарегистрировать в checks/index.ts. */
+/** Результат выполнения авто-проверки (без метаданных — их несёт CheckSpec). */
+export interface CheckRun {
+  status: CheckStatus;
+  summary: string;
+  findings: CheckFinding[];
+}
+
+/** Реализация авто-проверки. id связывает её с записью каталога. */
 export interface Check {
   id: string;
-  title: string;
-  run(ctx: CheckContext): CheckResult | Promise<CheckResult>;
+  run(ctx: CheckContext): CheckRun | Promise<CheckRun>;
+}
+
+/** Запись каталога + текущий статус (метаданные + результат/«ручная»/«todo»). */
+export interface CheckOutcome {
+  spec: CheckSpec;
+  status: CheckStatus;
+  summary: string;
+  findings: CheckFinding[];
 }

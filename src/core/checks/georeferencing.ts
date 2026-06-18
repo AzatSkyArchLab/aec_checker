@@ -5,10 +5,10 @@ import {
   IFCPOSTALADDRESS,
   IFCSITE,
 } from "web-ifc";
-import type { Check, CheckContext, CheckFinding, CheckResult } from "./types.ts";
+import type { Check, CheckContext, CheckFinding, CheckRun } from "./types.ts";
 
 /**
- * Проверка геопривязки: ищет ЛЮБЫЕ признаки того, что модель привязана
+ * IFC-24 «Привязка к местности»: ищет ЛЮБЫЕ признаки того, что модель привязана
  * к реальным координатам. Покрывает все типовые способы хранения георефа в IFC.
  *
  * Градация:
@@ -18,9 +18,8 @@ import type { Check, CheckContext, CheckFinding, CheckResult } from "./types.ts"
  *   fail — никаких упоминаний геопривязки не найдено
  */
 export const georeferencingCheck: Check = {
-  id: "georeferencing",
-  title: "Геопривязка",
-  run({ api, modelID }: CheckContext): CheckResult {
+  id: "IFC-24",
+  run({ api, modelID }: CheckContext): CheckRun {
     const findings: CheckFinding[] = [];
     let strong = false; // полноценная привязка (CRS / MapConversion)
 
@@ -130,20 +129,26 @@ export const georeferencingCheck: Check = {
   },
 };
 
-function finalize(findings: CheckFinding[], strong: boolean): CheckResult {
-  let status: CheckResult["status"];
-  let summary: string;
+function finalize(findings: CheckFinding[], strong: boolean): CheckRun {
   if (findings.length === 0) {
-    status = "fail";
-    summary = "Геопривязка не найдена — нет ни одного упоминания координат";
-  } else if (strong) {
-    status = "pass";
-    summary = `Геопривязка задана (${findings.length} призн.): CRS/MapConversion`;
-  } else {
-    status = "warn";
-    summary = `Только частичные признаки (${findings.length}) — полноценной CRS/MapConversion нет`;
+    return {
+      status: "fail",
+      summary: "Геопривязка не найдена — нет ни одного упоминания координат",
+      findings,
+    };
   }
-  return { id: "georeferencing", title: "Геопривязка", status, summary, findings };
+  if (strong) {
+    return {
+      status: "pass",
+      summary: `Геопривязка задана (${findings.length} призн.): CRS/MapConversion`,
+      findings,
+    };
+  }
+  return {
+    status: "warn",
+    summary: `Только частичные признаки (${findings.length}) — полноценной CRS/MapConversion нет`,
+    findings,
+  };
 }
 
 // ── Утилиты ──────────────────────────────────────────────────────────────────
