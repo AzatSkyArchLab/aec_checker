@@ -30,6 +30,9 @@ export class IfcParser {
   private offset: ModelOffset = { x: 0, y: 0, z: 0 };
   /** Последняя построенная геометрия (для среза по Z=0). */
   private meshes: IfcMeshData[] = [];
+  /** Мета загруженного файла (для проверок именования/размера/формата). */
+  private fileName = "";
+  private fileSize = 0;
 
   constructor() {
     this.api = new IfcAPI();
@@ -45,7 +48,10 @@ export class IfcParser {
   }
 
   /** Загружает модель из бинарных данных файла. Закрывает предыдущую. */
-  async open(data: Uint8Array): Promise<void> {
+  async open(
+    data: Uint8Array,
+    meta?: { fileName?: string; fileSize?: number },
+  ): Promise<void> {
     await this.init();
     this.close();
     // БЕЗ COORDINATE_TO_ORIGIN: рецентрируем сами (getMeshes), чтобы знать offset
@@ -53,6 +59,8 @@ export class IfcParser {
     this.modelID = this.api.OpenModel(data);
     this.offset = { x: 0, y: 0, z: 0 };
     this.meshes = [];
+    this.fileName = meta?.fileName ?? "";
+    this.fileSize = meta?.fileSize ?? data.byteLength;
   }
 
   /** Закрывает текущую модель и освобождает память. */
@@ -88,7 +96,12 @@ export class IfcParser {
   /** Прогоняет весь каталог проверок ЦИМ АГР по модели. */
   async runChecks(): Promise<CheckOutcome[]> {
     this.assertOpen();
-    return runChecks({ api: this.api, modelID: this.modelID });
+    return runChecks({
+      api: this.api,
+      modelID: this.modelID,
+      fileName: this.fileName,
+      fileSize: this.fileSize,
+    });
   }
 
   private toElement(expressID: number): IfcElement {

@@ -190,7 +190,7 @@ async function loadFile(file: File): Promise<void> {
     const buffer = new Uint8Array(await file.arrayBuffer());
 
     setStatus("Парсинг IFC…");
-    await parser.open(buffer);
+    await parser.open(buffer, { fileName: file.name, fileSize: file.size });
 
     const elements = parser.getElements();
     elementList.setElements(elements);

@@ -34,10 +34,14 @@ export interface CheckSpec {
   mode: "auto" | "manual";
 }
 
-/** Контекст, который получает проверка (прямой доступ к web-ifc). */
+/** Контекст, который получает проверка (прямой доступ к web-ifc + мета файла). */
 export interface CheckContext {
   api: IfcAPI;
   modelID: number;
+  /** Имя загруженного файла (для проверок именования/формата). */
+  fileName: string;
+  /** Размер файла в байтах. */
+  fileSize: number;
 }
 
 /** Результат выполнения авто-проверки (без метаданных — их несёт CheckSpec). */
