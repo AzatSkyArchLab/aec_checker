@@ -5,6 +5,8 @@ import { ElementList } from "./ui/element-list.ts";
 import { PropertiesPanel } from "./ui/properties-panel.ts";
 import { ChecksPanel } from "./ui/checks-panel.ts";
 import { MapView } from "./ui/map-view.ts";
+import { downloadChecksReport } from "./ui/pdf-report.ts";
+import type { CheckOutcome } from "./core/checks/index.ts";
 
 /**
  * Точка входа: связывает ядро (IfcParser), 3D-вьювер и UI-панели.
@@ -103,9 +105,13 @@ const btnIsolate = $<HTMLButtonElement>("#btn-isolate");
 const btnHide = $<HTMLButtonElement>("#btn-hide");
 const btnShowAll = $<HTMLButtonElement>("#btn-showall");
 const btnMap = $<HTMLButtonElement>("#btn-map");
+const btnReport = $<HTMLButtonElement>("#btn-report");
 
 /** Загружена ли геометрия (для активации кнопки карты). */
 let hasGeometry = false;
+/** Последние результаты проверок и имя файла — для PDF-отчёта. */
+let lastChecks: CheckOutcome[] = [];
+let lastFileName = "";
 
 function updateToolbar(): void {
   const n = selection.size;
@@ -114,9 +120,24 @@ function updateToolbar(): void {
   btnHide.disabled = n === 0;
   btnShowAll.disabled = !viewer.hasHidden();
   btnMap.disabled = !hasGeometry;
+  btnReport.disabled = lastChecks.length === 0;
 }
 
 btnMap.addEventListener("click", () => void showOnMap());
+
+btnReport.addEventListener("click", () => void exportReport());
+
+async function exportReport(): Promise<void> {
+  if (lastChecks.length === 0) return;
+  setStatus("Формирование PDF-отчёта…");
+  try {
+    await downloadChecksReport(lastFileName, lastChecks, new Date().toLocaleString("ru-RU"));
+    setStatus(`Отчёт сформирован · ${lastFileName}`);
+  } catch (err) {
+    console.error(err);
+    setStatus("Ошибка формирования PDF");
+  }
+}
 
 async function showOnMap(): Promise<void> {
   setStatus("Срез на уровне 0…");
@@ -186,6 +207,7 @@ async function loadFile(file: File): Promise<void> {
   selection.clear();
   lastSelected = null;
   hasGeometry = false;
+  lastChecks = [];
   try {
     const buffer = new Uint8Array(await file.arrayBuffer());
 
@@ -203,6 +225,8 @@ async function loadFile(file: File): Promise<void> {
     setStatus("Проверки модели…");
     const checks = await parser.runChecks();
     checksPanel.show(checks);
+    lastChecks = checks;
+    lastFileName = file.name;
 
     toolbar.hidden = false;
     updateToolbar();
