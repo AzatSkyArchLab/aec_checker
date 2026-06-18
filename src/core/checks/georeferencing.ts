@@ -6,22 +6,23 @@ import {
   IFCSITE,
 } from "web-ifc";
 import type { Check, CheckContext, CheckFinding, CheckRun } from "./types.ts";
+import { getGeoReference } from "../geo.ts";
+import { describeLocation, isInMoscow } from "./moscow.ts";
 
 /**
- * IFC-24 «Привязка к местности»: ищет ЛЮБЫЕ признаки того, что модель привязана
- * к реальным координатам. Покрывает все типовые способы хранения георефа в IFC.
+ * IFC-24 «Привязка к местности»: проверяет, что модель привязана к реальным
+ * координатам И что эти координаты попадают на территорию Москвы.
  *
  * Градация:
- *   pass — есть CRS и/или MapConversion (полноценная привязка, LoGeoRef 50)
- *   warn — есть только частичные признаки (широта/долгота сайта, истинный
- *          север, адрес) — привязка неполная
- *   fail — никаких упоминаний геопривязки не найдено
+ *   pass — привязка вычислена и точка в пределах Москвы (вкл. Новую Москву)
+ *   fail — привязка ведёт ВНЕ территории Москвы, либо привязки нет вовсе
+ *   warn — есть признаки привязки, но координаты вычислить нельзя (CRS не
+ *          поддержана / нет широты-долготы)
  */
 export const georeferencingCheck: Check = {
   id: "IFC-24",
-  run({ api, modelID }: CheckContext): CheckRun {
+  async run({ api, modelID }: CheckContext): Promise<CheckRun> {
     const findings: CheckFinding[] = [];
-    let strong = false; // полноценная привязка (CRS / MapConversion)
 
     // 1. CRS: IfcProjectedCRS / IfcGeographicCRS (через базовый тип).
     for (const id of linesOfType(api, modelID, IFCCOORDINATEREFERENCESYSTEM)) {
@@ -38,7 +39,6 @@ export const georeferencingCheck: Check = {
         detail: parts.join(", ") || undefined,
         expressID: id,
       });
-      strong = true;
     }
 
     // 2. MapConversion: IfcMapConversion / ...Scaled (через базовый тип).
@@ -63,7 +63,6 @@ export const georeferencingCheck: Check = {
         detail: parts.join("; ") || undefined,
         expressID: id,
       });
-      strong = true;
     }
 
     // 3. IfcSite: RefLatitude / RefLongitude / RefElevation (LoGeoRef 40).
@@ -125,31 +124,43 @@ export const georeferencingCheck: Check = {
       }
     }
 
-    return finalize(findings, strong);
-  },
-};
+    // Вычисляем фактический якорь (широта/долгота) и проверяем территорию Москвы.
+    const ref = await getGeoReference(api, modelID);
+    if (ref.ok) {
+      const { lat0, lng0 } = ref.ref;
+      const coord = `${lat0.toFixed(5)}°, ${lng0.toFixed(5)}°`;
+      if (isInMoscow(lat0, lng0)) {
+        return {
+          status: "pass",
+          summary: `Привязка в пределах Москвы: ${coord}`,
+          findings,
+        };
+      }
+      return {
+        status: "fail",
+        summary: `Привязка ВНЕ территории Москвы: ${coord} (${describeLocation(lat0, lng0)})`,
+        findings: [
+          { label: "Координаты вне Москвы", detail: `${coord} — ${describeLocation(lat0, lng0)}` },
+          ...findings,
+        ],
+      };
+    }
 
-function finalize(findings: CheckFinding[], strong: boolean): CheckRun {
-  if (findings.length === 0) {
+    // Якорь вычислить нельзя.
+    if (findings.length > 0) {
+      return {
+        status: "warn",
+        summary: `Признаки привязки есть, но координаты не определить: ${ref.reason}`,
+        findings,
+      };
+    }
     return {
       status: "fail",
       summary: "Геопривязка не найдена — нет ни одного упоминания координат",
       findings,
     };
-  }
-  if (strong) {
-    return {
-      status: "pass",
-      summary: `Геопривязка задана (${findings.length} призн.): CRS/MapConversion`,
-      findings,
-    };
-  }
-  return {
-    status: "warn",
-    summary: `Только частичные признаки (${findings.length}) — полноценной CRS/MapConversion нет`,
-    findings,
-  };
-}
+  },
+};
 
 // ── Утилиты ──────────────────────────────────────────────────────────────────
 
