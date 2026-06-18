@@ -18,7 +18,8 @@
 
 html,
 body,
-#app {
+#app,
+#app-gis {
   height: 100%;
   margin: 0;
 }
@@ -701,4 +702,136 @@ body {
 }
 .panel-body::-webkit-scrollbar-thumb:hover {
   background: #44464c;
+}
+
+/* ── Стартовый экран ────────────────────────────────────── */
+.landing {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+.landing[hidden] {
+  display: none;
+}
+.landing-inner {
+  text-align: center;
+  max-width: 760px;
+  padding: 24px;
+}
+.landing-title {
+  font-size: 26px;
+  font-weight: 600;
+}
+.landing-title::first-letter {
+  color: var(--accent);
+}
+.landing-sub {
+  color: var(--text-dim);
+  margin-top: 6px;
+  margin-bottom: 28px;
+}
+.landing-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+.landing-card {
+  font: inherit;
+  text-align: left;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px 22px 26px;
+  cursor: pointer;
+  color: var(--text);
+  transition: border-color 0.15s, transform 0.08s;
+}
+.landing-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+}
+.lc-icon {
+  font-size: 30px;
+  color: var(--accent);
+}
+.lc-title {
+  font-size: 17px;
+  font-weight: 600;
+  margin-top: 12px;
+}
+.lc-sub {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 6px;
+  line-height: 1.5;
+}
+@media (max-width: 640px) {
+  .landing-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Кнопка возврата в меню */
+.home-btn {
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  margin-right: 4px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.home-btn:hover {
+  border-color: var(--accent);
+}
+
+/* ── ГИС-вид ────────────────────────────────────────────── */
+.app-gis {
+  display: flex;
+  flex-direction: column;
+}
+.app-gis[hidden] {
+  display: none;
+}
+.gis-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.gis-map {
+  position: absolute;
+  inset: 0;
+  background: #aad3df;
+}
+.gis-info {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 500;
+  background: rgba(30, 31, 35, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  backdrop-filter: blur(6px);
+}
+.gis-info[hidden] {
+  display: none;
+}
+.gis-info-row {
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+.gis-info-row b {
+  color: var(--text);
+  font-family: var(--font);
 }

@@ -7,6 +7,7 @@ import { ChecksPanel } from "./ui/checks-panel.ts";
 import { MapView } from "./ui/map-view.ts";
 import { downloadChecksReport } from "./ui/pdf-report.ts";
 import type { CheckOutcome } from "./core/checks/index.ts";
+import type { GisView } from "./gis/gis.ts";
 
 /**
  * Точка входа: связывает ядро (IfcParser), 3D-вьювер и UI-панели.
@@ -263,3 +264,59 @@ viewport.addEventListener("drop", (e) => {
 });
 
 setStatus("Готов к загрузке");
+
+// ── Стартовый экран и роутинг (IFC / ГИС) ────────────────────────────────────
+
+const landing = $<HTMLElement>("#landing");
+const appIfc = $<HTMLElement>("#app");
+const appGis = $<HTMLElement>("#app-gis");
+let gisView: GisView | null = null;
+
+function showLanding(): void {
+  landing.hidden = false;
+}
+function showIfc(): void {
+  landing.hidden = true;
+  appGis.hidden = true;
+  appIfc.style.display = "";
+  window.dispatchEvent(new Event("resize")); // вернуть размер 3D-вьюверу
+}
+async function showGis(): Promise<void> {
+  landing.hidden = true;
+  appIfc.style.display = "none";
+  appGis.hidden = false;
+  if (!gisView) gisView = await initGis();
+}
+
+async function initGis(): Promise<GisView> {
+  const { GisView } = await import("./gis/gis.ts");
+  const view = new GisView(
+    $("#gis-map"),
+    $("#gis-status"),
+    $("#gis-info"),
+    $("#gis-dropzone"),
+  );
+  $<HTMLInputElement>("#gis-file").addEventListener("change", (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    if (f) void view.loadFbx(f);
+  });
+  const gbody = $<HTMLElement>(".gis-body");
+  const gdrop = $<HTMLElement>("#gis-dropzone");
+  gbody.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    gdrop.classList.add("dragging");
+  });
+  gbody.addEventListener("dragleave", () => gdrop.classList.remove("dragging"));
+  gbody.addEventListener("drop", (e) => {
+    e.preventDefault();
+    gdrop.classList.remove("dragging");
+    const f = e.dataTransfer?.files?.[0];
+    if (f && f.name.toLowerCase().endsWith(".fbx")) void view.loadFbx(f);
+  });
+  return view;
+}
+
+$("#go-ifc").addEventListener("click", showIfc);
+$("#go-gis").addEventListener("click", () => void showGis());
+$("#ifc-home").addEventListener("click", showLanding);
+$("#gis-home").addEventListener("click", showLanding);

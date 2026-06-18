@@ -6,9 +6,29 @@
     <title>AGR Checker — IFC-парсер</title>
   </head>
   <body>
+    <div id="landing" class="landing">
+      <div class="landing-inner">
+        <div class="landing-title">AGR / AEC Checker</div>
+        <div class="landing-sub">Выберите режим работы</div>
+        <div class="landing-cards">
+          <button class="landing-card" id="go-ifc">
+            <div class="lc-icon">▣</div>
+            <div class="lc-title">Проверить IFC</div>
+            <div class="lc-sub">Каталог проверок ЦИМ АГР, 3D-просмотр, отчёт PDF</div>
+          </button>
+          <button class="landing-card" id="go-gis">
+            <div class="lc-icon">◍</div>
+            <div class="lc-title">ГИС</div>
+            <div class="lc-sub">FBX (МСК-77) → нижний срез → карта OSM</div>
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div id="app">
       <header class="topbar">
         <div class="brand">
+          <button id="ifc-home" class="home-btn" title="В меню">←</button>
           <span class="logo">▣</span>
           <span class="brand-name">AGR Checker</span>
           <span class="brand-sub">IFC parser & viewer</span>
@@ -75,6 +95,35 @@
           <div id="map" class="map-canvas"></div>
           <div id="map-message" class="map-message" hidden></div>
         </div>
+      </div>
+    </div>
+
+    <div id="app-gis" class="app-gis" hidden>
+      <header class="topbar">
+        <div class="brand">
+          <button id="gis-home" class="home-btn" title="В меню">←</button>
+          <span class="logo">◍</span>
+          <span class="brand-name">ГИС</span>
+          <span class="brand-sub">FBX (МСК-77) → карта</span>
+        </div>
+        <div class="topbar-actions">
+          <span id="gis-status" class="status"></span>
+          <label class="btn">
+            Открыть FBX
+            <input id="gis-file" type="file" accept=".fbx" hidden />
+          </label>
+        </div>
+      </header>
+      <div class="gis-body">
+        <div id="gis-map" class="gis-map"></div>
+        <div id="gis-dropzone" class="dropzone">
+          <div class="dropzone-inner">
+            <div class="dropzone-icon">⬇</div>
+            <div class="dropzone-text">Перетащите <b>.fbx</b> файл сюда</div>
+            <div class="dropzone-hint">МСК-77 · нижний срез модели лягут на карту</div>
+          </div>
+        </div>
+        <div id="gis-info" class="gis-info" hidden></div>
       </div>
     </div>
 
