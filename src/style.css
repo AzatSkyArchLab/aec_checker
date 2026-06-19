@@ -359,6 +359,29 @@ body {
 .check-dot.status-absent {
   background: #7d8da0;
 }
+
+/* GIS-01: модалка результата + эскиз (вид сверху) */
+.gis01-dialog {
+  max-width: 840px;
+  width: 92%;
+}
+.gis01-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.gis01-sketch {
+  display: flex;
+  justify-content: center;
+  background: #fff;
+  border-radius: 8px;
+  padding: 8px;
+  overflow: auto;
+}
+.gis01-sketch svg {
+  max-width: 100%;
+  height: auto;
+}
 .check-body {
   padding: 0 12px 8px 41px;
 }

@@ -112,6 +112,7 @@
             <input id="gis-cadastre" type="checkbox" checked />
             Кадастр
           </label>
+          <button id="gis01-run" class="btn" title="GIS-01: здание в границах ЗУ (нужны ГПЗУ + FBX)">Проверка GIS-01</button>
           <label class="btn">
             Открыть ГПЗУ
             <input id="gis-gpzu" type="file" accept=".pdf" hidden />
@@ -132,6 +133,24 @@
           </div>
         </div>
         <div id="gis-info" class="gis-info" hidden></div>
+      </div>
+
+      <div id="gis01-modal" class="map-modal" hidden>
+        <div class="map-dialog gis01-dialog">
+          <div class="map-head">
+            <div class="map-titles">
+              <span class="map-title">GIS-01 · Здание в границах ЗУ</span>
+              <span id="gis01-verdict" class="map-method"></span>
+            </div>
+            <div class="gis01-actions">
+              <button id="gis01-download" class="tool-btn" title="Скачать эскиз (PNG)">⬇ Эскиз PNG</button>
+              <button id="gis01-close" class="map-close" aria-label="Закрыть">✕</button>
+            </div>
+          </div>
+          <div class="map-body">
+            <div id="gis01-sketch" class="gis01-sketch"></div>
+          </div>
+        </div>
       </div>
     </div>
 

@@ -21,6 +21,33 @@ const $ = <T extends HTMLElement>(sel: string): T => {
   return el;
 };
 
+/** Рендерит SVG-эскиз в PNG (×2) и скачивает — для отчёта GIS-01. */
+function downloadSvgAsPng(svg: string, filename: string): void {
+  const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+  const img = new Image();
+  img.onload = () => {
+    const scale = 2;
+    const canvas = document.createElement("canvas");
+    canvas.width = (img.width || 760) * scale;
+    canvas.height = (img.height || 620) * scale;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.scale(scale, scale);
+      ctx.drawImage(img, 0, 0);
+      canvas.toBlob((b) => {
+        if (!b) return;
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(b);
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      }, "image/png");
+    }
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+
 const parser = new IfcParser();
 const viewer = new Viewer($("#viewer"));
 const elementList = new ElementList($("#element-list"));
@@ -351,6 +378,29 @@ async function initGis(): Promise<GisView> {
     const name = f.name.toLowerCase();
     if (name.endsWith(".fbx")) void view.loadFbx(f);
     else if (name.endsWith(".pdf")) void view.openGpzu(f);
+  });
+
+  // ── Проверка GIS-01: здание в границах ЗУ ──────────────────────────────────
+  const gis01Modal = $<HTMLElement>("#gis01-modal");
+  const gis01Verdict = $<HTMLElement>("#gis01-verdict");
+  const gis01Sketch = $<HTMLElement>("#gis01-sketch");
+  let gis01Svg = "";
+  $("#gis01-run").addEventListener("click", () => {
+    void view.runGis01().then((res) => {
+      if (!res) return; // статус-сообщение уже показано (нет ГПЗУ/FBX)
+      gis01Svg = res.svg;
+      gis01Verdict.textContent = res.summary;
+      gis01Verdict.className = `map-method status-${res.status}`;
+      gis01Sketch.innerHTML = res.svg;
+      gis01Modal.hidden = false;
+    });
+  });
+  $("#gis01-close").addEventListener("click", () => (gis01Modal.hidden = true));
+  gis01Modal.addEventListener("click", (e) => {
+    if (e.target === gis01Modal) gis01Modal.hidden = true;
+  });
+  $("#gis01-download").addEventListener("click", () => {
+    if (gis01Svg) downloadSvgAsPng(gis01Svg, "GIS-01_эскиз.png");
   });
   return view;
 }

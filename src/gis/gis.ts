@@ -50,6 +50,8 @@ export class GisView {
   private targetMsk: Pt | null = null;
   /** Кольца участка из ГПЗУ (МСК-77, X=север Y=восток). */
   private gpzuRings: GpzuPoint[][] | null = null;
+  /** Геометрия последнего FBX (для многоуровневых срезов в GIS-01). */
+  private fbx: import("./gis01.ts").FbxGeom | null = null;
 
   constructor(
     private mapEl: HTMLElement,
@@ -107,6 +109,8 @@ export class GisView {
 
       const sliceV = min[vAxis] + 0.01;
       const footprint = sliceFootprint(meshes, vAxis, hA, hB, sliceV);
+      // Сохраняем геометрию для GIS-01 (многоуровневые срезы).
+      this.fbx = { meshes, min, max, vAxis, hA, hB, isCloud: tris === 0 };
 
       await this.ensureMap();
       this.draw(footprint, [center[hA], center[hB]]);
@@ -185,7 +189,8 @@ export class GisView {
     const [lng, lat] = this.proj4(MSK77, "WGS84", [east, north]);
     return [lng, lat]; // GeoJSON-порядок [lng, lat]
   }
-  private ll(p: Pt): [number, number] {
+  /** Горизонтальные координаты среза FBX → МСК-77 [east,north] с учётом калибровки. */
+  private toMskCal(p: Pt): Pt {
     let [e, n] = this.toMsk(p[0], p[1]);
     // Доворот вокруг центра модели (в кадре МСК-77), затем сдвиг.
     if (this.calibRot !== 0 && this.lastCenter) {
@@ -196,7 +201,33 @@ export class GisView {
       e = e0 + de * cos - dn * sin;
       n = n0 + de * sin + dn * cos;
     }
-    return this.toWgs84(e + this.calibE, n + this.calibN);
+    return [e + this.calibE, n + this.calibN];
+  }
+  private ll(p: Pt): [number, number] {
+    const [e, n] = this.toMskCal(p);
+    return this.toWgs84(e, n);
+  }
+
+  /**
+   * Проверка GIS-01 «Здание полностью в границах ЗУ».
+   * Нужны загруженные ГПЗУ (участок) и FBX (здание). Возвращает результат +
+   * SVG-эскиз (вид сверху). Сами вычисления — в gis01.ts.
+   */
+  async runGis01(): Promise<{ status: string; summary: string; svg: string } | null> {
+    if (!this.fbx) {
+      this.setStatus("GIS-01: сначала загрузите FBX-модель здания");
+      return null;
+    }
+    if (!this.gpzuRings || this.gpzuRings.length === 0) {
+      this.setStatus("GIS-01: сначала загрузите ГПЗУ (участок)");
+      return null;
+    }
+    const { runGis01, sketchSvg } = await import("./gis01.ts");
+    const ringsEN: Pt[][] = this.gpzuRings.map((r) => r.map((p) => [p.Y, p.X] as Pt)); // [east,north]
+    const res = runGis01(this.fbx, ringsEN, (p) => this.toMskCal(p));
+    const svg = sketchSvg(res, {});
+    this.setStatus(`GIS-01: ${res.summary}`);
+    return { status: res.status, summary: res.summary, svg };
   }
 
   private draw(fp: Footprint, centerMsk: Pt, fit = true): void {
