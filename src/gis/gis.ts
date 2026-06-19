@@ -92,36 +92,70 @@ export class GisView {
       const buf = await file.arrayBuffer();
       const group = new FBXLoader().parse(buf, "");
       group.updateMatrixWorld(true);
-
-      const { meshes, min, max, verts, tris } = collectWorld(group);
-      if (verts === 0) {
+      const world = collectWorld(group);
+      if (world.verts === 0) {
         this.setStatus("В FBX не найдено геометрии");
         return;
       }
-      const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
-      const vAxis = [0, 1, 2].reduce((a, i) => (Math.abs(center[i]) < Math.abs(center[a]) ? i : a), 0);
-      const [hA, hB] = [0, 1, 2].filter((i) => i !== vAxis) as [number, number];
-
-      await this.ensureProj4();
-      // FBX из МСК-77 — Z-up; FBXLoader поворачивает в Y-up (x,y,z)→(x,z,-y):
-      // ось1 = высота, ось0 = East (Y_МСК), ось2 = -North (X_МСК).
-      this.toMsk = vAxis === 1 ? (a, b) => [a, -b] : (a, b) => [a, b];
-
-      const sliceV = min[vAxis] + 0.01;
-      const footprint = sliceFootprint(meshes, vAxis, hA, hB, sliceV);
-      // Сохраняем геометрию для GIS-01 (многоуровневые срезы).
-      this.fbx = { meshes, min, max, vAxis, hA, hB, isCloud: tris === 0 };
-
-      await this.ensureMap();
-      this.draw(footprint, [center[hA], center[hB]]);
-
-      this.setStatus(
-        `${file.name} · ${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "точки"} · точек среза: ${footprint.points.length || footprint.rings.reduce((s, r) => s + r.length, 0)}`,
-      );
-      this.showInfo(min, max, vAxis);
+      await this.placeModel(world, file.name);
     } catch (err) {
       console.error(err);
       this.setStatus("Ошибка загрузки FBX");
+      this.dropzone.classList.remove("hidden");
+    }
+  }
+
+  /**
+   * Общая укладка модели (FBX или IFC) на карту: оба источника дают геометрию
+   * в Y-up (FBXLoader и web-ifc), поэтому ось/срез/калибровка/GIS-01 — единые.
+   */
+  private async placeModel(
+    world: { meshes: WorldMesh[]; min: number[]; max: number[]; verts: number; tris: number },
+    fileName: string,
+  ): Promise<void> {
+    const { meshes, min, max, verts, tris } = world;
+    const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+    // FBXLoader и web-ifc отдают Y-up → вертикаль всегда ось1 (надёжнее эвристики
+    // по |center|, которая ломалась для моделей у начала координат).
+    const vAxis = 1;
+    const [hA, hB] = [0, 2] as [number, number];
+
+    await this.ensureProj4();
+    // ось1 = высота, ось0 = East (Y_МСК), ось2 = -North (X_МСК) — общая конвенция Y-up.
+    this.toMsk = (a, b) => [a, -b];
+
+    const sliceV = min[vAxis] + 0.01;
+    const footprint = sliceFootprint(meshes, vAxis, hA, hB, sliceV);
+    this.fbx = { meshes, min, max, vAxis, hA, hB, isCloud: tris === 0 };
+
+    await this.ensureMap();
+    this.draw(footprint, [center[hA], center[hB]]);
+    this.setStatus(
+      `${fileName} · ${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "точки"} · точек среза: ${footprint.points.length || footprint.rings.reduce((s, r) => s + r.length, 0)}`,
+    );
+    this.showInfo(min, max, vAxis);
+  }
+
+  /** Загружает IFC: web-ifc → меши (Y-up) → тот же конвейер, что FBX (срез на карту + GIS-01). */
+  async openIfc(file: File): Promise<void> {
+    this.setStatus(`Чтение IFC «${file.name}»…`);
+    this.dropzone.classList.add("hidden");
+    try {
+      await this.ensureMap(); // карта до тяжёлого парсинга web-ifc
+      const { IfcParser } = await import("../core/ifc-parser.ts");
+      const parser = new IfcParser();
+      const buf = new Uint8Array(await file.arrayBuffer());
+      await parser.open(buf, { fileName: file.name, fileSize: buf.length });
+      const world = ifcMeshesToWorld(parser.getMeshes());
+      parser.close();
+      if (world.verts === 0) {
+        this.setStatus("В IFC не найдено геометрии");
+        return;
+      }
+      await this.placeModel(world, file.name);
+    } catch (err) {
+      console.error(err);
+      this.setStatus(`Ошибка загрузки IFC: ${(err as Error).message}`);
       this.dropzone.classList.remove("hidden");
     }
   }
@@ -685,6 +719,37 @@ function collectWorld(group: THREE.Object3D): {
     if (idx) tris += idx.length / 3;
     meshes.push({ world, index: idx });
   });
+  return { meshes, min, max, verts, tris };
+}
+
+/** web-ifc меши ({positions, indices}, world Y-up) → формат конвейера FBX (с bbox). */
+function ifcMeshesToWorld(ms: { positions: Float32Array; indices: ArrayLike<number> }[]): {
+  meshes: WorldMesh[];
+  min: number[];
+  max: number[];
+  verts: number;
+  tris: number;
+} {
+  const meshes: WorldMesh[] = [];
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  let verts = 0;
+  let tris = 0;
+  for (const m of ms) {
+    const p = m.positions;
+    if (!p || p.length === 0) continue;
+    meshes.push({ world: p, index: m.indices });
+    verts += p.length / 3;
+    tris += m.indices.length / 3;
+    for (let i = 0; i < p.length; i += 3) {
+      if (p[i] < min[0]) min[0] = p[i];
+      if (p[i] > max[0]) max[0] = p[i];
+      if (p[i + 1] < min[1]) min[1] = p[i + 1];
+      if (p[i + 1] > max[1]) max[1] = p[i + 1];
+      if (p[i + 2] < min[2]) min[2] = p[i + 2];
+      if (p[i + 2] > max[2]) max[2] = p[i + 2];
+    }
+  }
   return { meshes, min, max, verts, tris };
 }
 

@@ -125,6 +125,10 @@
             Открыть FBX
             <input id="gis-file" type="file" accept=".fbx" hidden />
           </label>
+          <label class="btn">
+            Открыть IFC
+            <input id="gis-ifc" type="file" accept=".ifc" hidden />
+          </label>
         </div>
       </header>
       <div class="gis-body">
@@ -132,8 +136,8 @@
         <div id="gis-dropzone" class="dropzone">
           <div class="dropzone-inner">
             <div class="dropzone-icon">⬇</div>
-            <div class="dropzone-text">Перетащите <b>.pdf</b> (ГПЗУ) или <b>.fbx</b> сюда</div>
-            <div class="dropzone-hint">ГПЗУ → участок по координатам МСК-77; FBX → нижний срез модели</div>
+            <div class="dropzone-text">Перетащите <b>.fbx</b> / <b>.ifc</b> (модель) или <b>.pdf</b> (ГПЗУ) / <b>.dwg</b> (участок)</div>
+            <div class="dropzone-hint">Модель (FBX/IFC) → нижний срез на карту; ГПЗУ/DWG → граница ЗУ (МСК-77)</div>
           </div>
         </div>
         <div id="gis-info" class="gis-info" hidden></div>

@@ -367,6 +367,10 @@ async function initGis(): Promise<GisView> {
     const f = (e.target as HTMLInputElement).files?.[0];
     if (f) void view.openDwg(f);
   });
+  $<HTMLInputElement>("#gis-ifc").addEventListener("change", (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    if (f) void view.openIfc(f);
+  });
   const gbody = $<HTMLElement>(".gis-body");
   const gdrop = $<HTMLElement>("#gis-dropzone");
   gbody.addEventListener("dragover", (e) => {
@@ -381,6 +385,7 @@ async function initGis(): Promise<GisView> {
     if (!f) return;
     const name = f.name.toLowerCase();
     if (name.endsWith(".fbx")) void view.loadFbx(f);
+    else if (name.endsWith(".ifc")) void view.openIfc(f);
     else if (name.endsWith(".pdf")) void view.openGpzu(f);
     else if (name.endsWith(".dwg")) void view.openDwg(f);
   });
