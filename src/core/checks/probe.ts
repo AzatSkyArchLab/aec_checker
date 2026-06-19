@@ -30,18 +30,10 @@ export function buildInventory(source: string): Inventory {
   return { source };
 }
 
-/** Загружает приватный реестр-зонд; пусто, если файла нет (публичная сборка). */
-let cache: Record<string, ProbeSpec> | null = null;
+/** Реестр-зонд встроен в движок (публичный, без текста алгоритмов/НПА). */
 export async function loadProbeMap(): Promise<Record<string, ProbeSpec>> {
-  if (cache) return cache;
-  try {
-    const res = await fetch(`${import.meta.env.BASE_URL}checks-probemap.json`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    cache = (await res.json()) as Record<string, ProbeSpec>;
-  } catch {
-    cache = {};
-  }
-  return cache;
+  const { PROBE_MAP } = await import("./public-catalog.ts");
+  return PROBE_MAP;
 }
 
 /** Есть ли в модели хоть один экземпляр типа `name` (с учётом подтипов). null — тип неизвестен web-ifc. */

@@ -20,4 +20,3 @@ yarn-error.log*
 !.vscode/extensions.json
 .idea/
 public/*.fbx
-public/checks-probemap.json
