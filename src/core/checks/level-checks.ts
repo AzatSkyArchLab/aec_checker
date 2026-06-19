@@ -18,6 +18,25 @@ const LEVEL_NAMES = [
 ];
 const LEVEL_TYPES = ["основной", "дополнительный"];
 
+// IFC-37: допустимая форма номера зависит от наименования уровня (поле 3).
+const ABOVE_GROUND = new Set(["Этаж", "Мансардный этаж", "Чердак"]);
+const PLINTH = new Set(["Цокольный этаж"]);
+const BELOW_GROUND = new Set(["Подземный этаж", "Подвальный этаж"]);
+const TECHNICAL = new Set(["Технический этаж", "Техническое пространство", "Техническое подполье"]);
+const POS_INT = /^[1-9]\d*$/;
+const NEG_INT = /^-[1-9]\d*$/;
+const P_NUM = /^П[1-9]\d*$/;
+const FRACTION = /^\d+\/\d+$/;
+
+/** Номер уровня (поле 2) согласован с наименованием (поле 3) по п.4.7.8.2/Табл.4.4. */
+function levelNumberValid(numStr: string, name3: string): boolean {
+  if (ABOVE_GROUND.has(name3)) return POS_INT.test(numStr); // надземные — с 1
+  if (PLINTH.has(name3)) return numStr === "0"; // цокольный — строго 0
+  if (BELOW_GROUND.has(name3)) return NEG_INT.test(numStr) || P_NUM.test(numStr); // подземные — отриц. или П1,П2
+  if (TECHNICAL.has(name3)) return FRACTION.test(numStr) || POS_INT.test(numStr) || NEG_INT.test(numStr); // тех. — «1/2» или целое
+  return LEVEL_NUM_RE.test(numStr); // наименование не распознано (ловит IFC-38) — проверяем форму
+}
+
 interface Storey {
   id: number;
   name: string;
@@ -99,11 +118,17 @@ const subObjectCheck: Check = {
   },
 };
 
-/** IFC-37: поле 2 — номер уровня. */
+/** IFC-37: поле 2 — номер уровня, согласованный с наименованием (поле 3). */
 const levelNumberCheck: Check = {
   id: "IFC-37",
   run(ctx) {
-    return perStorey(ctx, 1, (v) => LEVEL_NUM_RE.test(v), "Поле 2 корректно", "некорректный номер уровня");
+    return perStorey(
+      ctx,
+      1,
+      (v, s) => levelNumberValid(v, s.name.split("_")[2] ?? ""),
+      "Поле 2 корректно",
+      "номер не согласован с типом уровня",
+    );
   },
 };
 

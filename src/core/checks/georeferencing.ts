@@ -13,21 +13,30 @@ import { describeLocation, isInMoscow } from "./moscow.ts";
  * IFC-24 «Привязка к местности»: проверяет, что модель привязана к реальным
  * координатам И что эти координаты попадают на территорию Москвы.
  *
- * Градация:
- *   pass — привязка вычислена и точка в пределах Москвы (вкл. Новую Москву)
+ * Градация (п.4.5.4 требует: координаты в МСК + Балтийская система высот +
+ * проектный угол поворота, для базовой точки и всех элементов):
+ *   pass — точка в пределах Москвы И подтверждены СК(МСК)/высота/угол поворота
+ *   warn — точка в Москве, но часть требований не подтверждена; либо есть
+ *          признаки привязки, но координаты вычислить нельзя
  *   fail — привязка ведёт ВНЕ территории Москвы, либо привязки нет вовсе
- *   warn — есть признаки привязки, но координаты вычислить нельзя (CRS не
- *          поддержана / нет широты-долготы)
  */
 export const georeferencingCheck: Check = {
   id: "IFC-24",
   async run({ api, modelID }: CheckContext): Promise<CheckRun> {
     const findings: CheckFinding[] = [];
+    // Признаки выполнения требований п.4.5.4 (для градации pass/warn).
+    let hasCRS = false;
+    let mskLikely = false;
+    let hasRotation = false;
+    let hasHeight = false;
 
     // 1. CRS: IfcProjectedCRS / IfcGeographicCRS (через базовый тип).
     for (const id of linesOfType(api, modelID, IFCCOORDINATEREFERENCESYSTEM)) {
       const l = safeLine(api, modelID, id);
       if (!l) continue;
+      hasCRS = true;
+      const crsText = `${text(l.Name)} ${text(l.GeodeticDatum)} ${text(l.MapProjection)}`;
+      if (/МСК|\bMSK\b/i.test(crsText)) mskLikely = true;
       const parts = [
         text(l.Name),
         text(l.GeodeticDatum) && `датум ${text(l.GeodeticDatum)}`,
@@ -48,13 +57,15 @@ export const georeferencingCheck: Check = {
       const e = num(l.Eastings);
       const n = num(l.Northings);
       const h = num(l.OrthogonalHeight);
+      if (h != null) hasHeight = true;
       const parts: string[] = [];
       if (e != null || n != null) parts.push(`E ${fmt(e)}, N ${fmt(n)}`);
       if (h != null) parts.push(`H ${fmt(h)}`);
       const xa = num(l.XAxisAbscissa);
       const xo = num(l.XAxisOrdinate);
-      if (xa != null && xo != null && (xa !== 1 || xo !== 0)) {
-        parts.push(`поворот ${fmt((Math.atan2(xo, xa) * 180) / Math.PI)}°`);
+      if (xa != null && xo != null) {
+        hasRotation = true;
+        if (xa !== 1 || xo !== 0) parts.push(`поворот ${fmt((Math.atan2(xo, xa) * 180) / Math.PI)}°`);
       }
       const s = num(l.Scale);
       if (s != null && s !== 1) parts.push(`масштаб ${fmt(s)}`);
@@ -73,6 +84,7 @@ export const georeferencingCheck: Check = {
       const lon = compoundAngleToDeg(site.RefLongitude);
       const elev = num(site.RefElevation);
       if (lat == null && lon == null && elev == null) continue;
+      if (elev != null) hasHeight = true;
       const parts: string[] = [];
       if (lat != null && lon != null) {
         parts.push(`${lat.toFixed(6)}°, ${lon.toFixed(6)}°`);
@@ -93,6 +105,7 @@ export const georeferencingCheck: Check = {
       const ctx = safeLine(api, modelID, id);
       const ref = ctx?.TrueNorth;
       if (!ref || typeof ref.value !== "number") continue;
+      hasRotation = true;
       let detail: string | undefined;
       const dir = safeLine(api, modelID, ref.value);
       const ratios = (dir?.DirectionRatios ?? []).map((v: any) => num(v));
@@ -130,10 +143,22 @@ export const georeferencingCheck: Check = {
       const { lat0, lng0 } = ref.ref;
       const coord = `${lat0.toFixed(5)}°, ${lng0.toFixed(5)}°`;
       if (isInMoscow(lat0, lng0)) {
+        // pass только при подтверждении всех требований п.4.5.4; иначе honest warn.
+        const unmet: string[] = [];
+        if (!hasHeight) unmet.push("высотная отметка (Z / Балтийская система)");
+        if (!hasRotation) unmet.push("проектный угол поворота");
+        if (!hasCRS) unmet.push("СК (IfcProjectedCRS)");
+        else if (!mskLikely) unmet.push("СК не подтверждена как МСК");
+        if (unmet.length === 0) {
+          return { status: "pass", summary: `Привязка в пределах Москвы: ${coord}`, findings };
+        }
         return {
-          status: "pass",
-          summary: `Привязка в пределах Москвы: ${coord}`,
-          findings,
+          status: "warn",
+          summary: `Привязка в Москве (${coord}), но не подтверждено: ${unmet.join("; ")}`,
+          findings: [
+            { label: "Не подтверждено", detail: unmet.join("; ") },
+            ...findings,
+          ],
         };
       }
       return {
