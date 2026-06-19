@@ -806,7 +806,8 @@ body {
   flex: 1 1 auto;
   min-height: 0;
 }
-.gis-map {
+/* id-селектор перебивает .maplibregl-map { position: relative } из maplibre.css */
+#gis-map.gis-map {
   position: absolute;
   inset: 0;
   background: #aad3df;
@@ -834,4 +835,19 @@ body {
 .gis-info-row b {
   color: var(--text);
   font-family: var(--font);
+}
+
+/* Переключатель кадастра в ГИС-топбаре */
+.gis-cad-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.gis-cad-toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
 }

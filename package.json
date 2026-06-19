@@ -24,6 +24,7 @@
   "license": "MIT",
   "dependencies": {
     "leaflet": "^1.9.4",
+    "maplibre-gl": "^5.24.0",
     "pdfmake": "^0.3.11",
     "proj4": "^2.20.9",
     "three": "^0.184.0",

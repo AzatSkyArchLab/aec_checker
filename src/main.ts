@@ -286,6 +286,7 @@ async function showGis(): Promise<void> {
   appIfc.style.display = "none";
   appGis.hidden = false;
   if (!gisView) gisView = await initGis();
+  gisView.open();
 }
 
 async function initGis(): Promise<GisView> {
@@ -295,6 +296,7 @@ async function initGis(): Promise<GisView> {
     $("#gis-status"),
     $("#gis-info"),
     $("#gis-dropzone"),
+    $<HTMLInputElement>("#gis-cadastre"),
   );
   $<HTMLInputElement>("#gis-file").addEventListener("change", (e) => {
     const f = (e.target as HTMLInputElement).files?.[0];

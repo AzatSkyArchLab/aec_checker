@@ -1,24 +1,34 @@
-import "leaflet/dist/leaflet.css";
+import "maplibre-gl/dist/maplibre-gl.css";
+import maplibregl from "maplibre-gl";
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 
 /**
- * ГИС-режим: FBX в МСК-77 → нижний срез модели → контур на OSM-карте «как в FBX».
- * Проекция МСК-77 (выверена, см. rosreestr.py): tmerc lat_0=55°40′, lon_0=37.5°,
- * Красовский + towgs84 Пулково-1942→WGS84. proj4 отдаёт [east, north].
+ * ГИС-режим: FBX в МСК-77 → нижний срез модели → точки на карте «как в FBX»,
+ * совмещённые с кадастром Москвы (MVT-слой 101 metatiler, как в generative_concepts).
+ *
+ * МСК-77 (выверена, см. rosreestr.py): tmerc lat_0=55°40′, lon_0=37.5°, Красовский +
+ * towgs84 Пулково-1942→WGS84. proj4 отдаёт [east, north].
  */
 const MSK77 =
   "+proj=tmerc +lat_0=55.66666666666667 +lon_0=37.5 +k=1 +x_0=0 +y_0=0 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +units=m +no_defs";
 
+// Кадастр: MVT-сервер metatiler (Swagger /tiles/{layer}/{z}/{x}/{y}); 101 = кадастр Москвы.
+const METATILER_BASE = "https://meta-tiler-stage.metapolis.su";
+const CADASTRE_LAYER_ID = 101;
+const CADASTRE_SRC_LAYER = "main"; // имя source-layer в MVT этого сервера
+const OSM_TILES = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png";
+
 const FOOTPRINT_COLOR = "#e8590c";
+const CADASTRE_COLOR = "#1f77b4";
 type Pt = [number, number];
 
 export class GisView {
-  private L: any = null;
-  private map: any = null;
-  private layer: any = null;
+  private map: maplibregl.Map | null = null;
+  private ready: Promise<void> | null = null;
   private proj4: any = null;
-  /** (горизонт. координаты среза) → (east, north) МСК-77. Задаётся по оси «верх». */
+  private centerMarker: maplibregl.Marker | null = null;
+  /** (горизонт. координаты среза) → (east, north) МСК-77. */
   private toMsk: (a: number, b: number) => Pt = (a, b) => [a, b];
 
   constructor(
@@ -26,13 +36,23 @@ export class GisView {
     private statusEl: HTMLElement,
     private infoEl: HTMLElement,
     private dropzone: HTMLElement,
-  ) {}
+    private cadastreToggle: HTMLInputElement,
+  ) {
+    this.cadastreToggle.addEventListener("change", () => {
+      this.setCadastreVisible(this.cadastreToggle.checked);
+    });
+  }
 
   private setStatus(t: string): void {
     this.statusEl.textContent = t;
   }
 
-  /** Загружает FBX, режет низ модели, проецирует в WGS84, кладёт на карту. */
+  /** Поднимает карту (basemap + кадастр) — вызывается при входе в ГИС. */
+  open(): void {
+    void this.ensureMap();
+  }
+
+  /** Загружает FBX, режет низ модели, проецирует в WGS84, кладёт точки на карту. */
   async loadFbx(file: File): Promise<void> {
     this.setStatus(`Чтение «${file.name}»…`);
     this.dropzone.classList.add("hidden");
@@ -47,19 +67,14 @@ export class GisView {
         return;
       }
       const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
-      // Вертикальная ось — у которой центр ближе всего к нулю (МСК-77 X,Y ~ тысячи м,
-      // высота/отметка — десятки/сотни). Остальные две — горизонталь.
       const vAxis = [0, 1, 2].reduce((a, i) => (Math.abs(center[i]) < Math.abs(center[a]) ? i : a), 0);
       const [hA, hB] = [0, 1, 2].filter((i) => i !== vAxis) as [number, number];
 
       await this.ensureProj4();
-      // FBX из МСК-77 — Z-up; FBXLoader поворачивает в Y-up как (x,y,z)→(x,z,-y).
-      // Поэтому ось1 = высота, ось0 = East (Y_МСК), ось2 = -North (X_МСК).
-      // → горизонтальная пара (hA,hB)=(0,2): east = hA, north = -hB.
+      // FBX из МСК-77 — Z-up; FBXLoader поворачивает в Y-up (x,y,z)→(x,z,-y):
+      // ось1 = высота, ось0 = East (Y_МСК), ось2 = -North (X_МСК).
       this.toMsk = vAxis === 1 ? (a, b) => [a, -b] : (a, b) => [a, b];
-      console.log("[GIS] bbox min", min, "max", max, "| вертикаль = ось", vAxis);
 
-      // Срез нижней части модели: vAxis = minV + 0.01.
       const sliceV = min[vAxis] + 0.01;
       const footprint = sliceFootprint(meshes, vAxis, hA, hB, sliceV);
 
@@ -67,7 +82,7 @@ export class GisView {
       this.draw(footprint, [center[hA], center[hB]]);
 
       this.setStatus(
-        `${file.name} · ${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "точки"} · контуров: ${footprint.rings.length + footprint.lines.length + footprint.points.length}`,
+        `${file.name} · ${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "точки"} · точек среза: ${footprint.points.length || footprint.rings.reduce((s, r) => s + r.length, 0)}`,
       );
       this.showInfo(min, max, vAxis);
     } catch (err) {
@@ -77,57 +92,64 @@ export class GisView {
     }
   }
 
-  /** МСК-77 (east=Y, north=X) → [lat, lng]. */
   private toWgs84(east: number, north: number): [number, number] {
     const [lng, lat] = this.proj4(MSK77, "WGS84", [east, north]);
-    return [lat, lng];
+    return [lng, lat]; // GeoJSON-порядок [lng, lat]
+  }
+  private ll(p: Pt): [number, number] {
+    const [e, n] = this.toMsk(p[0], p[1]);
+    return this.toWgs84(e, n);
   }
 
   private draw(fp: Footprint, centerMsk: Pt): void {
-    const L = this.L;
-    this.layer.clearLayers();
-    const bounds = L.latLngBounds([]);
-    const toLL = (p: Pt) => {
-      const [e, n] = this.toMsk(p[0], p[1]);
-      return this.toWgs84(e, n);
+    const map = this.map!;
+    const features: any[] = [];
+    const bounds = new maplibregl.LngLatBounds();
+    const ext = (c: [number, number]) => {
+      if (Number.isFinite(c[0]) && Number.isFinite(c[1]) && Math.abs(c[1]) <= 90) bounds.extend(c);
     };
 
     for (const ring of fp.rings) {
-      const ll = ring.map(toLL).filter(valid);
-      if (ll.length >= 3) {
-        L.polygon(ll, { color: FOOTPRINT_COLOR, weight: 2, fillOpacity: 0.25 }).addTo(this.layer);
-        ll.forEach((p: Pt) => bounds.extend(p));
+      const coords = ring.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
+      if (coords.length >= 3) {
+        features.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [coords] }, properties: { k: "ring" } });
+        coords.forEach(ext);
       }
     }
     for (const line of fp.lines) {
-      const ll = line.map(toLL).filter(valid);
-      if (ll.length >= 2) {
-        L.polyline(ll, { color: FOOTPRINT_COLOR, weight: 2 }).addTo(this.layer);
-        ll.forEach((p: Pt) => bounds.extend(p));
+      const coords = line.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
+      if (coords.length >= 2) {
+        features.push({ type: "Feature", geometry: { type: "LineString", coordinates: coords }, properties: { k: "line" } });
+        coords.forEach(ext);
       }
     }
-    for (const pt of fp.points) {
-      const ll = toLL(pt);
-      if (!valid(ll)) continue;
-      L.circleMarker(ll, { radius: 2, color: FOOTPRINT_COLOR, fillOpacity: 0.7, weight: 0 }).addTo(this.layer);
-      bounds.extend(ll);
+    if (fp.points.length) {
+      const coords = fp.points.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
+      coords.forEach((c) => {
+        features.push({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: { k: "pt" } });
+        ext(c);
+      });
     }
 
-    const c = toLL(centerMsk);
-    if (valid(c)) {
-      L.circleMarker(c, { radius: 7, color: "#fff", weight: 2, fillColor: FOOTPRINT_COLOR, fillOpacity: 1 })
-        .addTo(this.layer)
-        .bindTooltip("Модель (срез у основания)", { permanent: true, direction: "top" });
-      bounds.extend(c);
+    (map.getSource("footprint") as maplibregl.GeoJSONSource).setData({
+      type: "FeatureCollection",
+      features,
+    } as any);
+
+    const c = this.ll(centerMsk);
+    this.centerMarker?.remove();
+    if (Math.abs(c[1]) <= 90) {
+      this.centerMarker = new maplibregl.Marker({ color: FOOTPRINT_COLOR })
+        .setLngLat(c)
+        .setPopup(new maplibregl.Popup({ offset: 24 }).setText("Модель (срез у основания)"))
+        .addTo(map);
+      ext(c);
     }
 
-    const fit = () => {
-      this.map.invalidateSize();
-      if (bounds.isValid()) this.map.fitBounds(bounds, { padding: [50, 50], maxZoom: 20 });
-      else if (valid(c)) this.map.setView(c, 17);
-    };
-    fit();
-    setTimeout(fit, 80);
+    if (!bounds.isEmpty()) {
+      map.fitBounds(bounds, { padding: 60, maxZoom: 19, duration: 0 });
+    }
+    map.resize();
   }
 
   private showInfo(min: number[], max: number[], vAxis: number): void {
@@ -141,33 +163,130 @@ export class GisView {
       <div class="gis-info-row">вертикаль: ось ${vAxis} · срез +0.01 от низа</div>`;
   }
 
+  private setCadastreVisible(vis: boolean): void {
+    if (!this.map) return;
+    const v = vis ? "visible" : "none";
+    for (const id of ["cad-fill", "cad-line"]) {
+      if (this.map.getLayer(id)) this.map.setLayoutProperty(id, "visibility", v);
+    }
+  }
+
   private async ensureProj4(): Promise<void> {
     if (this.proj4) return;
     this.proj4 = (await import("proj4")).default;
   }
 
-  private async ensureMap(): Promise<void> {
-    if (this.map) return;
-    const mod: any = await import("leaflet");
-    this.L = mod.default ?? mod;
-    const L = this.L;
-    this.map = L.map(this.mapEl, { zoomControl: true, maxZoom: 22, preferCanvas: true });
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxNativeZoom: 19,
-      maxZoom: 22,
-      attribution: "© OpenStreetMap",
-    }).addTo(this.map);
-    this.layer = L.layerGroup().addTo(this.map);
-    this.map.setView([55.75, 37.62], 10);
+  private ensureMap(): Promise<void> {
+    if (this.ready) return this.ready;
+    this.map = new maplibregl.Map({
+      container: this.mapEl,
+      center: [37.62, 55.75],
+      zoom: 9,
+      attributionControl: { compact: true },
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: "raster",
+            tiles: [OSM_TILES],
+            tileSize: 256,
+            attribution: "© OpenStreetMap, © CARTO",
+          },
+          cadastre: {
+            type: "vector",
+            tiles: [`${METATILER_BASE}/tiles/${CADASTRE_LAYER_ID}/{z}/{x}/{y}`],
+            minzoom: 0,
+            maxzoom: 16,
+          },
+        },
+        layers: [
+          { id: "osm", type: "raster", source: "osm" },
+          {
+            id: "cad-fill",
+            type: "fill",
+            source: "cadastre",
+            "source-layer": CADASTRE_SRC_LAYER,
+            paint: { "fill-color": CADASTRE_COLOR, "fill-opacity": 0.1 },
+          },
+          {
+            id: "cad-line",
+            type: "line",
+            source: "cadastre",
+            "source-layer": CADASTRE_SRC_LAYER,
+            paint: { "line-color": CADASTRE_COLOR, "line-width": 0.8, "line-opacity": 0.7 },
+          },
+        ],
+      },
+    });
+    this.map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
+
+    this.ready = new Promise((resolve) => {
+      this.map!.on("load", () => {
+        this.addFootprintLayers();
+        this.wireCadastrePopup();
+        resolve();
+      });
+    });
+    return this.ready;
+  }
+
+  private addFootprintLayers(): void {
+    const map = this.map!;
+    map.addSource("footprint", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({
+      id: "fp-fill",
+      type: "fill",
+      source: "footprint",
+      filter: ["==", ["get", "k"], "ring"],
+      paint: { "fill-color": FOOTPRINT_COLOR, "fill-opacity": 0.25 },
+    });
+    map.addLayer({
+      id: "fp-line",
+      type: "line",
+      source: "footprint",
+      filter: ["in", ["get", "k"], ["literal", ["ring", "line"]]],
+      paint: { "line-color": FOOTPRINT_COLOR, "line-width": 2 },
+    });
+    map.addLayer({
+      id: "fp-pt",
+      type: "circle",
+      source: "footprint",
+      filter: ["==", ["get", "k"], "pt"],
+      paint: { "circle-radius": 2.5, "circle-color": FOOTPRINT_COLOR, "circle-opacity": 0.8 },
+    });
+  }
+
+  private wireCadastrePopup(): void {
+    const map = this.map!;
+    map.on("click", "cad-fill", (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p: any = f.properties || {};
+      const row = (label: string, val: any) =>
+        val ? `<div><b>${label}:</b> ${String(val)}</div>` : "";
+      const html = `
+        <div style="font:12px sans-serif;max-width:280px">
+          ${row("Кадастровый №", p.cadastral_number)}
+          ${row("Адрес", p.address)}
+          ${row("Категория", p.land_category)}
+          ${row("Разреш. использование", p.permitted_use)}
+          ${row("Площадь, м²", p.square)}
+          ${row("Статус", p.status)}
+        </div>`;
+      new maplibregl.Popup({ maxWidth: "300px" }).setLngLat(e.lngLat).setHTML(html).addTo(map);
+    });
+    map.on("mouseenter", "cad-fill", () => (map.getCanvas().style.cursor = "pointer"));
+    map.on("mouseleave", "cad-fill", () => (map.getCanvas().style.cursor = ""));
   }
 }
+
+// ── Геометрия FBX ────────────────────────────────────────────────────────────
 
 interface Footprint {
   rings: Pt[][];
   lines: Pt[][];
   points: Pt[];
 }
-
 interface WorldMesh {
   world: Float32Array;
   index: ArrayLike<number> | null;
@@ -211,7 +330,6 @@ function collectWorld(group: THREE.Object3D): {
   return { meshes, min, max, verts, tris };
 }
 
-/** Нижний срез: пересечение с плоскостью vAxis=sliceV, контур в (hA,hB). */
 function sliceFootprint(
   meshes: WorldMesh[],
   vAxis: number,
@@ -245,7 +363,6 @@ function sliceFootprint(
     }
   }
 
-  // Точечные FBX (облака без граней): берём вершины у самого низа.
   if (!anyTris) {
     let minV = Infinity;
     let maxV = -Infinity;
@@ -259,9 +376,6 @@ function sliceFootprint(
       for (let i = 0; i < m.world.length; i += 3) {
         if (m.world[i + vAxis] <= minV + band) points.push([m.world[i + hA], m.world[i + hB]]);
       }
-    // Контур облака: выпуклая оболочка нижних точек.
-    const hull = convexHull(points);
-    if (hull.length >= 3) rings.push(hull);
   }
   return { rings, lines, points };
 }
@@ -320,35 +434,4 @@ function stitch(segs: [Pt, Pt][]): { loops: Pt[][]; open: Pt[][] } {
     else if (pts.length >= 2) open.push(pts);
   }
   return { loops, open };
-}
-
-/** Выпуклая оболочка (Andrew monotone chain) — замкнутый контур точек. */
-function convexHull(pts: Pt[]): Pt[] {
-  if (pts.length < 3) return pts.slice();
-  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  const cross = (o: Pt, a: Pt, b: Pt) =>
-    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-  const lower: Pt[] = [];
-  for (const q of p) {
-    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0) lower.pop();
-    lower.push(q);
-  }
-  const upper: Pt[] = [];
-  for (let i = p.length - 1; i >= 0; i--) {
-    const q = p[i];
-    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0) upper.pop();
-    upper.push(q);
-  }
-  lower.pop();
-  upper.pop();
-  return lower.concat(upper);
-}
-
-function valid(ll: [number, number]): boolean {
-  return (
-    Number.isFinite(ll[0]) &&
-    Number.isFinite(ll[1]) &&
-    Math.abs(ll[0]) <= 90 &&
-    Math.abs(ll[1]) <= 180
-  );
 }
