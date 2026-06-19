@@ -259,6 +259,9 @@ function sliceFootprint(
       for (let i = 0; i < m.world.length; i += 3) {
         if (m.world[i + vAxis] <= minV + band) points.push([m.world[i + hA], m.world[i + hB]]);
       }
+    // Контур облака: выпуклая оболочка нижних точек.
+    const hull = convexHull(points);
+    if (hull.length >= 3) rings.push(hull);
   }
   return { rings, lines, points };
 }
@@ -317,6 +320,28 @@ function stitch(segs: [Pt, Pt][]): { loops: Pt[][]; open: Pt[][] } {
     else if (pts.length >= 2) open.push(pts);
   }
   return { loops, open };
+}
+
+/** Выпуклая оболочка (Andrew monotone chain) — замкнутый контур точек. */
+function convexHull(pts: Pt[]): Pt[] {
+  if (pts.length < 3) return pts.slice();
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o: Pt, a: Pt, b: Pt) =>
+    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower: Pt[] = [];
+  for (const q of p) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0) lower.pop();
+    lower.push(q);
+  }
+  const upper: Pt[] = [];
+  for (let i = p.length - 1; i >= 0; i--) {
+    const q = p[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0) upper.pop();
+    upper.push(q);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
 }
 
 function valid(ll: [number, number]): boolean {
