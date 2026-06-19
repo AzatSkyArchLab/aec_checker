@@ -837,6 +837,85 @@ body {
   font-family: var(--font);
 }
 
+/* Пад калибровки сдвига FBX к кадастру (МСК-77) */
+.gis-calib {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.gis-calib #gis-calib-val {
+  font-family: var(--mono);
+  color: var(--accent, #e8590c);
+  font-size: 11px;
+}
+.gis-calib-pad {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  margin: 6px 0 4px;
+}
+.gis-calib-mid {
+  display: flex;
+  gap: 3px;
+}
+.gis-calib-pad button {
+  width: 26px;
+  height: 24px;
+  background: var(--surface, #2a2b30);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+.gis-calib-pad button:hover {
+  background: var(--accent, #e8590c);
+  border-color: var(--accent, #e8590c);
+  color: #fff;
+}
+.gis-calib-step {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+}
+.gis-calib-step select,
+.gis-calib-rot select {
+  background: var(--surface, #2a2b30);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 11px;
+}
+.gis-calib-rot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin-top: 6px;
+}
+.gis-calib-rot button {
+  width: 26px;
+  height: 24px;
+  background: var(--surface, #2a2b30);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+.gis-calib-rot button:hover {
+  background: var(--accent, #e8590c);
+  border-color: var(--accent, #e8590c);
+  color: #fff;
+}
+
 /* Переключатель кадастра в ГИС-топбаре */
 .gis-cad-toggle {
   display: inline-flex;

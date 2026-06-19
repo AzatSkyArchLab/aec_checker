@@ -30,6 +30,19 @@ export class GisView {
   private centerMarker: maplibregl.Marker | null = null;
   /** (горизонт. координаты среза) → (east, north) МСК-77. */
   private toMsk: (a: number, b: number) => Pt = (a, b) => [a, b];
+  /**
+   * Ручная калибровка сдвига в МСК-77 (м): ΔВосток, ΔСевер. Кадастр (НСПД,
+   * индикативный) и FBX (привязан к точной выписке) расходятся на десятки
+   * метров — этот сдвиг дотягивает модель до кадастра. Применяется до proj4,
+   * т.е. полностью в кадре МСК-77. Хранится в localStorage (один на все модели).
+   */
+  private calibE = 0;
+  private calibN = 0;
+  /** Доворот FBX вокруг центра модели (град) — убирает остаточный поворот. */
+  private calibRot = 0;
+  /** Кэш последнего среза/центра для пере-отрисовки при изменении калибровки. */
+  private lastFp: Footprint | null = null;
+  private lastCenter: Pt | null = null;
 
   constructor(
     private mapEl: HTMLElement,
@@ -41,6 +54,16 @@ export class GisView {
     this.cadastreToggle.addEventListener("change", () => {
       this.setCadastreVisible(this.cadastreToggle.checked);
     });
+    try {
+      const saved = JSON.parse(localStorage.getItem("gis-calib") || "null");
+      if (saved && Number.isFinite(saved.e) && Number.isFinite(saved.n)) {
+        this.calibE = saved.e;
+        this.calibN = saved.n;
+        if (Number.isFinite(saved.rot)) this.calibRot = saved.rot;
+      }
+    } catch {
+      /* нет сохранённой калибровки — старт с нуля */
+    }
   }
 
   private setStatus(t: string): void {
@@ -97,11 +120,22 @@ export class GisView {
     return [lng, lat]; // GeoJSON-порядок [lng, lat]
   }
   private ll(p: Pt): [number, number] {
-    const [e, n] = this.toMsk(p[0], p[1]);
-    return this.toWgs84(e, n);
+    let [e, n] = this.toMsk(p[0], p[1]);
+    // Доворот вокруг центра модели (в кадре МСК-77), затем сдвиг.
+    if (this.calibRot !== 0 && this.lastCenter) {
+      const [e0, n0] = this.toMsk(this.lastCenter[0], this.lastCenter[1]);
+      const th = (this.calibRot * Math.PI) / 180;
+      const cos = Math.cos(th), sin = Math.sin(th);
+      const de = e - e0, dn = n - n0;
+      e = e0 + de * cos - dn * sin;
+      n = n0 + de * sin + dn * cos;
+    }
+    return this.toWgs84(e + this.calibE, n + this.calibN);
   }
 
-  private draw(fp: Footprint, centerMsk: Pt): void {
+  private draw(fp: Footprint, centerMsk: Pt, fit = true): void {
+    this.lastFp = fp;
+    this.lastCenter = centerMsk;
     const map = this.map!;
     const features: any[] = [];
     const bounds = new maplibregl.LngLatBounds();
@@ -146,10 +180,33 @@ export class GisView {
       ext(c);
     }
 
-    if (!bounds.isEmpty()) {
+    if (fit && !bounds.isEmpty()) {
       map.fitBounds(bounds, { padding: 60, maxZoom: 19, duration: 0 });
     }
     map.resize();
+  }
+
+  /** Меняет калибровку (ΔВосток, ΔСевер в м; Δθ в град), сохраняет, пере-рисует без зума. */
+  private applyCalib(e: number, n: number, rot: number): void {
+    this.calibE = Math.round(e * 100) / 100;
+    this.calibN = Math.round(n * 100) / 100;
+    this.calibRot = Math.round(rot * 100) / 100;
+    try {
+      localStorage.setItem(
+        "gis-calib",
+        JSON.stringify({ e: this.calibE, n: this.calibN, rot: this.calibRot }),
+      );
+    } catch {
+      /* localStorage недоступен — калибровка только на сессию */
+    }
+    this.updateCalibReadout();
+    if (this.lastFp && this.lastCenter) this.draw(this.lastFp, this.lastCenter, false);
+  }
+
+  private updateCalibReadout(): void {
+    const el = this.infoEl.querySelector("#gis-calib-val");
+    if (el)
+      el.textContent = `ΔВ ${this.calibE.toFixed(1)} · ΔС ${this.calibN.toFixed(1)} м · ∠ ${this.calibRot.toFixed(1)}°`;
   }
 
   private showInfo(min: number[], max: number[], vAxis: number): void {
@@ -160,7 +217,60 @@ export class GisView {
       <div class="gis-info-row">X: ${f(min[0])} … ${f(max[0])}</div>
       <div class="gis-info-row">Y: ${f(min[1])} … ${f(max[1])}</div>
       <div class="gis-info-row">Z: ${f(min[2])} … ${f(max[2])}</div>
-      <div class="gis-info-row">вертикаль: ось ${vAxis} · срез +0.01 от низа</div>`;
+      <div class="gis-info-row">вертикаль: ось ${vAxis} · срез +0.01 от низа</div>
+      <div class="gis-calib">
+        <div class="gis-info-row"><b>Калибровка к кадастру</b> <span id="gis-calib-val"></span></div>
+        <div class="gis-calib-pad">
+          <button data-calib="n+" title="север +">▲</button>
+          <div class="gis-calib-mid">
+            <button data-calib="e-" title="запад −">◀</button>
+            <button data-calib="reset" title="сброс всего">⟲</button>
+            <button data-calib="e+" title="восток +">▶</button>
+          </div>
+          <button data-calib="n-" title="север −">▼</button>
+        </div>
+        <label class="gis-calib-step">шаг сдвига
+          <select id="gis-calib-step">
+            <option value="0.1">0.1 м</option>
+            <option value="0.5">0.5 м</option>
+            <option value="1" selected>1 м</option>
+            <option value="5">5 м</option>
+            <option value="10">10 м</option>
+          </select>
+        </label>
+        <div class="gis-calib-rot">
+          <button data-calib="rot-" title="против часовой">↺</button>
+          <select id="gis-calib-rotstep">
+            <option value="0.1">0.1°</option>
+            <option value="0.5" selected>0.5°</option>
+            <option value="1">1°</option>
+          </select>
+          <button data-calib="rot+" title="по часовой">↻</button>
+        </div>
+      </div>`;
+    this.wireCalibControls();
+    this.updateCalibReadout();
+  }
+
+  /** Навешивает обработчики на пад калибровки в инфо-панели. */
+  private wireCalibControls(): void {
+    const stepEl = this.infoEl.querySelector<HTMLSelectElement>("#gis-calib-step");
+    const rotStepEl = this.infoEl.querySelector<HTMLSelectElement>("#gis-calib-rotstep");
+    const step = () => (stepEl ? parseFloat(stepEl.value) || 1 : 1);
+    const rotStep = () => (rotStepEl ? parseFloat(rotStepEl.value) || 0.5 : 0.5);
+    this.infoEl.querySelectorAll<HTMLButtonElement>("[data-calib]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const a = btn.dataset.calib;
+        const s = step();
+        if (a === "e+") this.applyCalib(this.calibE + s, this.calibN, this.calibRot);
+        else if (a === "e-") this.applyCalib(this.calibE - s, this.calibN, this.calibRot);
+        else if (a === "n+") this.applyCalib(this.calibE, this.calibN + s, this.calibRot);
+        else if (a === "n-") this.applyCalib(this.calibE, this.calibN - s, this.calibRot);
+        else if (a === "rot+") this.applyCalib(this.calibE, this.calibN, this.calibRot + rotStep());
+        else if (a === "rot-") this.applyCalib(this.calibE, this.calibN, this.calibRot - rotStep());
+        else if (a === "reset") this.applyCalib(0, 0, 0);
+      });
+    });
   }
 
   private setCadastreVisible(vis: boolean): void {
