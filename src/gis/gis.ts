@@ -150,6 +150,53 @@ export class GisView {
     }
   }
 
+  /**
+   * Загружает DWG: извлекает кривые по слоям, находит границу ЗУ (по имени слоя
+   * или крупнейший замкнутый контур), кладёт как участок (МСК-77) — как ГПЗУ.
+   * Без ГПЗУ этот контур используется для GIS-01.
+   */
+  async openDwg(file: File): Promise<void> {
+    this.setStatus(`Чтение DWG «${file.name}»…`);
+    this.dropzone.classList.add("hidden");
+    try {
+      // Сначала поднимаем карту и proj4 — ДО тяжёлого синхронного парсинга DWG
+      // (libredwg.convert блокирует главный поток и иначе ломает загрузку карты).
+      await this.ensureMap();
+      await this.ensureProj4();
+      const { parseDwg } = await import("./dwg.ts");
+      const res = await parseDwg(file);
+      if (res.rings.length === 0) {
+        this.setStatus(`DWG: контур ЗУ не найден. Слои: ${res.allLayers.slice(0, 8).join(", ") || "—"}`);
+        return;
+      }
+      const toGpzu = this.pickDwgAxis(res.rings);
+      this.gpzuRings = res.rings.map((r) => r.pts.map(toGpzu));
+      this.drawGpzu(true);
+      const npts = this.gpzuRings.reduce((s, r) => s + r.length, 0);
+      const layerInfo = res.matchedByLayer
+        ? `слой «${res.rings[0].layer}»`
+        : `крупнейший контур (слой ЗУ не распознан${res.allLayers.length ? "; слои: " + res.allLayers.slice(0, 5).join(", ") : ""})`;
+      this.setStatus(`DWG: ${file.name} · ${layerInfo} · точек: ${npts}`);
+    } catch (err) {
+      console.error(err);
+      this.setStatus(`Ошибка чтения DWG: ${(err as Error).message}`);
+    }
+  }
+
+  /** Авто-детект оси DWG→МСК-77: пробуем обе ориентации, берём попадание в Москву. */
+  private pickDwgAxis(rings: { pts: { x: number; y: number }[] }[]): (p: { x: number; y: number }) => GpzuPoint {
+    let sx = 0, sy = 0, k = 0;
+    for (const r of rings) for (const p of r.pts) { sx += p.x; sy += p.y; k++; }
+    const cx = sx / k, cy = sy / k;
+    const inMoscow = (lng: number, lat: number) => lat >= 55.09 && lat <= 56.08 && lng >= 36.75 && lng <= 38.0;
+    const llA = this.toWgs84(cx, cy); // A: east=x, north=y
+    const llB = this.toWgs84(cy, cx); // B: east=y, north=x
+    const aOk = inMoscow(llA[0], llA[1]);
+    const bOk = inMoscow(llB[0], llB[1]);
+    if (bOk && !aOk) return (p) => ({ X: p.x, Y: p.y }); // north=x, east=y
+    return (p) => ({ X: p.y, Y: p.x }); // дефолт A: north=y, east=x
+  }
+
   /** Рисует участок ГПЗУ (МСК-77 → WGS84 тем же proj4, что FBX) и делает его целью совмещения. */
   private drawGpzu(fit: boolean): void {
     if (!this.map || !this.gpzuRings) return;

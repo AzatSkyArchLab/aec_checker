@@ -23,6 +23,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@mlightcad/libredwg-web": "^0.7.4",
     "leaflet": "^1.9.4",
     "maplibre-gl": "^5.24.0",
     "pdfjs-dist": "^4.10.38",
