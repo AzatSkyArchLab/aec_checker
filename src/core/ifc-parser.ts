@@ -33,6 +33,7 @@ export class IfcParser {
   /** Мета загруженного файла (для проверок именования/размера/формата). */
   private fileName = "";
   private fileSize = 0;
+  private source = "";
 
   constructor() {
     this.api = new IfcAPI();
@@ -61,6 +62,8 @@ export class IfcParser {
     this.meshes = [];
     this.fileName = meta?.fileName ?? "";
     this.fileSize = meta?.fileSize ?? data.byteLength;
+    // Сырой STEP-текст для зонда наличия сущностей/Pset (тип-имена — ASCII).
+    this.source = new TextDecoder("utf-8", { fatal: false }).decode(data);
   }
 
   /** Закрывает текущую модель и освобождает память. */
@@ -101,6 +104,7 @@ export class IfcParser {
       modelID: this.modelID,
       fileName: this.fileName,
       fileSize: this.fileSize,
+      source: this.source,
     });
   }
 

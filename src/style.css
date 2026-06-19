@@ -353,6 +353,12 @@ body {
 .check-dot.status-manual {
   background: #6fa8d6;
 }
+.status-absent {
+  color: #7d8da0;
+}
+.check-dot.status-absent {
+  background: #7d8da0;
+}
 .check-body {
   padding: 0 12px 8px 41px;
 }

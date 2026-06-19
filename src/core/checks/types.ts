@@ -3,10 +3,11 @@ import type { IfcAPI } from "web-ifc";
 /**
  * Статус проверки:
  *  pass/warn/fail/info — результат выполненной авто-проверки;
- *  todo — авто-проверка ещё не реализована;
- *  manual — требует ручной/внешней проверки (УКЭП, BCF, коллизии и т.п.).
+ *  todo — авто-проверка ещё не реализована (но нужная сущность в IFC есть);
+ *  absent — нужной IFC-сущности/атрибута в модели нет («нет такого атрибута»);
+ *  manual — требует ручной/внешней проверки (УКЭП, имя файла, BCF и т.п.).
  */
-export type CheckStatus = "pass" | "warn" | "fail" | "info" | "todo" | "manual";
+export type CheckStatus = "pass" | "warn" | "fail" | "info" | "todo" | "absent" | "manual";
 
 /** Один найденный сигнал внутри проверки. */
 export interface CheckFinding {
@@ -42,6 +43,8 @@ export interface CheckContext {
   fileName: string;
   /** Размер файла в байтах. */
   fileSize: number;
+  /** Сырой текст STEP-файла (для зонда наличия сущностей/Pset). */
+  source: string;
 }
 
 /** Результат выполнения авто-проверки (без метаданных — их несёт CheckSpec). */

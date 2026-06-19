@@ -6,6 +6,7 @@ const STATUS: Record<CheckStatus, { label: string; color: string }> = {
   fail: { label: "Не соответствует", color: "#c0392b" },
   info: { label: "Ошибка", color: "#c0392b" },
   manual: { label: "Ручная проверка", color: "#2f6fa8" },
+  absent: { label: "Нет атрибута", color: "#5a6b7a" },
   todo: { label: "Не реализована", color: "#8a8a8a" },
 };
 
@@ -40,7 +41,7 @@ export async function downloadChecksReport(
     },
   };
 
-  const counts = { pass: 0, warn: 0, fail: 0, info: 0, manual: 0, todo: 0 };
+  const counts = { pass: 0, warn: 0, fail: 0, info: 0, manual: 0, absent: 0, todo: 0 };
   for (const o of outcomes) counts[o.status]++;
   const fails = outcomes.filter((o) => o.status === "fail" || o.status === "info");
   const warns = outcomes.filter((o) => o.status === "warn");
@@ -49,14 +50,6 @@ export async function downloadChecksReport(
     fails.length > 0
       ? { text: `Выявлены несоответствия: ${fails.length}`, color: STATUS.fail.color }
       : { text: "Несоответствий не выявлено", color: STATUS.pass.color };
-
-  // Группировка по категориям с сохранением порядка.
-  const byCat = new Map<string, CheckOutcome[]>();
-  for (const o of outcomes) {
-    const arr = byCat.get(o.spec.category) ?? [];
-    arr.push(o);
-    byCat.set(o.spec.category, arr);
-  }
 
   const content: any[] = [
     { text: "Отчёт проверки ЦИМ АГР", style: "h1" },
@@ -104,31 +97,36 @@ export async function downloadChecksReport(
     });
   }
 
-  // Полный список по категориям.
-  content.push({ text: "Все проверки по категориям", style: "h2", pageBreak: "before", margin: [0, 0, 0, 6] });
-  for (const [category, items] of byCat) {
-    content.push({ text: category, style: "h3", margin: [0, 8, 0, 3] });
-    content.push({
-      table: {
-        headerRows: 1,
-        widths: [44, "*", 78],
-        body: [
-          [hcell("ID"), hcell("Проверка"), hcell("Статус")],
-          ...items.map((o) => [
-            { text: o.spec.id, fontSize: 8 },
-            {
-              stack: [
-                { text: o.spec.name },
-                ...(o.spec.source ? [{ text: o.spec.source, fontSize: 7, color: "#999" }] : []),
-              ],
-            },
-            { text: STATUS[o.status].label, color: STATUS[o.status].color, fontSize: 8 },
-          ]),
-        ],
-      },
-      layout: ZEBRA,
-    });
-  }
+  // Полный список — СТРОГО ПО СПИСКУ (в порядке каталога IFC-01 … IFC-NN).
+  const firstId = outcomes[0]?.spec.id ?? "";
+  const lastId = outcomes[outcomes.length - 1]?.spec.id ?? "";
+  content.push({
+    text: `Все проверки строго по списку (${firstId} … ${lastId})`,
+    style: "h2",
+    pageBreak: "before",
+    margin: [0, 0, 0, 6],
+  });
+  content.push({
+    table: {
+      headerRows: 1,
+      widths: [40, 70, "*", 70],
+      body: [
+        [hcell("ID"), hcell("Категория"), hcell("Проверка / результат"), hcell("Статус")],
+        ...outcomes.map((o) => [
+          { text: o.spec.id, fontSize: 8 },
+          { text: o.spec.category, fontSize: 7, color: "#666" },
+          {
+            stack: [
+              { text: o.spec.name, fontSize: 8 },
+              ...(o.summary ? [{ text: o.summary, fontSize: 7, color: "#555" }] : []),
+            ],
+          },
+          { text: STATUS[o.status].label, color: STATUS[o.status].color, fontSize: 8 },
+        ]),
+      ],
+    },
+    layout: ZEBRA,
+  });
 
   const docDefinition = {
     pageSize: "A4",
@@ -171,6 +169,7 @@ function summaryTable(
             cell("Соответствует", c.pass, STATUS.pass.color),
             cell("Частично", c.warn, STATUS.warn.color),
             cell("Не соответствует", c.fail + c.info, STATUS.fail.color),
+            cell("Нет атрибута", c.absent, STATUS.absent.color),
             cell("Ручная проверка", c.manual, STATUS.manual.color),
             cell("Не реализована", c.todo, STATUS.todo.color),
             [{ text: "Всего", bold: true }, { text: String(total), bold: true, alignment: "right" }],

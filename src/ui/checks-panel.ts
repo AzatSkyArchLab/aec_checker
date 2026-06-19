@@ -8,6 +8,7 @@ const STATUS_LABEL: Record<CheckStatus, string> = {
   fail: "не пройдена",
   info: "ошибка",
   todo: "не реализовано",
+  absent: "нет атрибута",
   manual: "ручная",
 };
 
@@ -18,6 +19,7 @@ const STATUS_RANK: Record<CheckStatus, number> = {
   pass: 3,
   info: 2,
   manual: 1,
+  absent: 1,
   todo: 0,
 };
 
@@ -59,7 +61,7 @@ export class ChecksPanel {
   }
 
   private renderHeader(outcomes: CheckOutcome[]): HTMLElement {
-    const counts = { pass: 0, warn: 0, fail: 0, info: 0, todo: 0, manual: 0 };
+    const counts = { pass: 0, warn: 0, fail: 0, info: 0, todo: 0, absent: 0, manual: 0 };
     for (const o of outcomes) counts[o.status]++;
     const header = document.createElement("div");
     header.className = "checks-header";
@@ -69,6 +71,7 @@ export class ChecksPanel {
         <span class="status-pass">✓ ${counts.pass}</span>
         <span class="status-warn">⚠ ${counts.warn}</span>
         <span class="status-fail">✗ ${counts.fail}</span>
+        <span class="status-absent">нет атр. ${counts.absent}</span>
         <span class="status-manual">ручных ${counts.manual}</span>
         <span class="status-todo">todo ${counts.todo}</span>
       </div>`;
