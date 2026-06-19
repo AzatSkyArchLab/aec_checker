@@ -2,6 +2,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import maplibregl from "maplibre-gl";
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
+import type { GpzuPoint } from "./gpzu.ts";
 
 /**
  * ГИС-режим: FBX в МСК-77 → нижний срез модели → точки на карте «как в FBX»,
@@ -22,6 +23,7 @@ const OSM_TILES = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}
 const FOOTPRINT_COLOR = "#e8590c";
 const CADASTRE_COLOR = "#1f77b4";
 const TARGET_COLOR = "#ffd400";
+const GPZU_COLOR = "#16a34a"; // зелёный — авторитетный участок из ГПЗУ (МСК-77)
 type Pt = [number, number];
 
 export class GisView {
@@ -44,8 +46,10 @@ export class GisView {
   /** Кэш последнего среза/центра для пере-отрисовки при изменении калибровки. */
   private lastFp: Footprint | null = null;
   private lastCenter: Pt | null = null;
-  /** Центр целевого кадастрового участка в МСК-77 (для «совместить центр»). */
+  /** Центр целевого участка (кадастр/ГПЗУ) в МСК-77 (для «совместить центр»). */
   private targetMsk: Pt | null = null;
+  /** Кольца участка из ГПЗУ (МСК-77, X=север Y=восток). */
+  private gpzuRings: GpzuPoint[][] | null = null;
 
   constructor(
     private mapEl: HTMLElement,
@@ -116,6 +120,65 @@ export class GisView {
       this.setStatus("Ошибка загрузки FBX");
       this.dropzone.classList.remove("hidden");
     }
+  }
+
+  /** Загружает ГПЗУ (PDF), строит участок по координатам поворотных точек (МСК-77). */
+  async openGpzu(file: File): Promise<void> {
+    this.setStatus(`Чтение ГПЗУ «${file.name}»…`);
+    this.dropzone.classList.add("hidden");
+    try {
+      const { parseGpzu } = await import("./gpzu.ts");
+      const parcel = await parseGpzu(file);
+      if (parcel.rings.length === 0) {
+        this.setStatus("В ГПЗУ не найдена таблица координат поворотных точек");
+        return;
+      }
+      this.gpzuRings = parcel.rings;
+      await this.ensureProj4();
+      await this.ensureMap();
+      this.drawGpzu(true);
+      const npts = parcel.rings.reduce((s, r) => s + r.length, 0);
+      const info = [parcel.cadNumber, parcel.area && `${parcel.area} м²`].filter(Boolean).join(" · ");
+      this.setStatus(`ГПЗУ: ${file.name}${info ? " · " + info : ""} · точек: ${npts}`);
+    } catch (err) {
+      console.error(err);
+      this.setStatus("Ошибка чтения ГПЗУ");
+    }
+  }
+
+  /** Рисует участок ГПЗУ (МСК-77 → WGS84 тем же proj4, что FBX) и делает его целью совмещения. */
+  private drawGpzu(fit: boolean): void {
+    if (!this.map || !this.gpzuRings) return;
+    const map = this.map;
+    const bounds = new maplibregl.LngLatBounds();
+    const features = this.gpzuRings.map((ring) => {
+      const coords = ring.map((p) => this.toWgs84(p.Y, p.X)); // Y=восток, X=север
+      for (const c of coords) {
+        if (Number.isFinite(c[0]) && Math.abs(c[1]) <= 90) bounds.extend(c);
+      }
+      const a = coords[0];
+      const z = coords[coords.length - 1];
+      if (a && z && (a[0] !== z[0] || a[1] !== z[1])) coords.push(a); // замкнуть кольцо
+      return { type: "Feature", geometry: { type: "Polygon", coordinates: [coords] }, properties: {} };
+    });
+    (map.getSource("gpzu") as maplibregl.GeoJSONSource).setData({
+      type: "FeatureCollection",
+      features,
+    } as any);
+
+    // Центр участка в МСК-77 → цель для «совместить центр» (north=X, east=Y).
+    let sX = 0, sY = 0, n = 0;
+    for (const r of this.gpzuRings) for (const p of r) { sX += p.X; sY += p.Y; n++; }
+    if (n > 0) {
+      this.targetMsk = [sY / n, sX / n]; // [east, north]
+      const snapBtn = this.infoEl.querySelector<HTMLButtonElement>("#gis-snap");
+      if (snapBtn) snapBtn.hidden = false;
+      const tInfo = this.infoEl.querySelector("#gis-target-info");
+      if (tInfo) tInfo.textContent = `Цель: участок ГПЗУ, центр МСК-77 E ${(sY / n).toFixed(1)} N ${(sX / n).toFixed(1)}`;
+    }
+
+    if (fit && !bounds.isEmpty()) map.fitBounds(bounds, { padding: 80, maxZoom: 19, duration: 0 });
+    map.resize();
   }
 
   private toWgs84(east: number, north: number): [number, number] {
@@ -275,6 +338,12 @@ export class GisView {
       if (e.key === "Enter") void this.findTargetParcel(input.value);
     });
     snapBtn?.addEventListener("click", () => this.snapToTarget());
+    // Если цель уже задана (ГПЗУ/кадастр загружены до FBX) — показать кнопку совмещения.
+    if (this.targetMsk && snapBtn) {
+      snapBtn.hidden = false;
+      const tInfo = this.infoEl.querySelector("#gis-target-info");
+      if (tInfo) tInfo.textContent = `Цель задана · центр МСК-77 E ${this.targetMsk[0].toFixed(1)} N ${this.targetMsk[1].toFixed(1)}`;
+    }
   }
 
   /** Находит участок по кад. номеру в загруженных тайлах, подсвечивает, считает центр в МСК-77. */
@@ -428,6 +497,20 @@ export class GisView {
       type: "line",
       source: "target",
       paint: { "line-color": TARGET_COLOR, "line-width": 3 },
+    });
+    // Участок из ГПЗУ — авторитетный эталон (МСК-77), ярко-зелёным.
+    map.addSource("gpzu", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({
+      id: "gpzu-fill",
+      type: "fill",
+      source: "gpzu",
+      paint: { "fill-color": GPZU_COLOR, "fill-opacity": 0.15 },
+    });
+    map.addLayer({
+      id: "gpzu-line",
+      type: "line",
+      source: "gpzu",
+      paint: { "line-color": GPZU_COLOR, "line-width": 2.5 },
     });
     map.addSource("footprint", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
     map.addLayer({

@@ -113,6 +113,10 @@
             Кадастр
           </label>
           <label class="btn">
+            Открыть ГПЗУ
+            <input id="gis-gpzu" type="file" accept=".pdf" hidden />
+          </label>
+          <label class="btn">
             Открыть FBX
             <input id="gis-file" type="file" accept=".fbx" hidden />
           </label>
@@ -123,8 +127,8 @@
         <div id="gis-dropzone" class="dropzone">
           <div class="dropzone-inner">
             <div class="dropzone-icon">⬇</div>
-            <div class="dropzone-text">Перетащите <b>.fbx</b> файл сюда</div>
-            <div class="dropzone-hint">МСК-77 · нижний срез модели лягут на карту</div>
+            <div class="dropzone-text">Перетащите <b>.pdf</b> (ГПЗУ) или <b>.fbx</b> сюда</div>
+            <div class="dropzone-hint">ГПЗУ → участок по координатам МСК-77; FBX → нижний срез модели</div>
           </div>
         </div>
         <div id="gis-info" class="gis-info" hidden></div>
