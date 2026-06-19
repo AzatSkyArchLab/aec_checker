@@ -41,6 +41,25 @@ function setStatus(text: string): void {
   statusEl.textContent = text;
 }
 
+/**
+ * Сбой загрузки динамического чанка: после деплоя старые chunk-файлы удаляются,
+ * и открытая ранее вкладка не может их догрузить (ленивые import pdfmake/ГИС).
+ */
+function isStaleChunkError(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err);
+  return /dynamically imported module|module script failed|Failed to fetch|Loading chunk|importing a module|error loading dynamically/i.test(
+    m,
+  );
+}
+
+/** Понятное сообщение «вышла новая версия» вместо загадочной ошибки. */
+const STALE_CHUNK_MSG = "Вышла новая версия — обновите страницу (Cmd/Ctrl+Shift+R)";
+
+// Сбой предзагрузки чанка (vite) на навигации — самовосстановление перезагрузкой.
+window.addEventListener("vite:preloadError", () => {
+  setStatus(STALE_CHUNK_MSG);
+});
+
 // ── Выбор элементов (мультивыбор по Shift) ────────────────────────────────────
 
 const selection = new Set<number>();
@@ -136,7 +155,11 @@ async function exportReport(): Promise<void> {
     setStatus(`Отчёт сформирован · ${lastFileName}`);
   } catch (err) {
     console.error(err);
-    setStatus("Ошибка формирования PDF");
+    if (isStaleChunkError(err)) {
+      setStatus(STALE_CHUNK_MSG);
+      return;
+    }
+    setStatus(`Ошибка формирования PDF: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -285,8 +308,15 @@ async function showGis(): Promise<void> {
   landing.hidden = true;
   appIfc.style.display = "none";
   appGis.hidden = false;
-  if (!gisView) gisView = await initGis();
-  gisView.open();
+  try {
+    if (!gisView) gisView = await initGis();
+    gisView.open();
+  } catch (err) {
+    console.error(err);
+    $("#gis-status").textContent = isStaleChunkError(err)
+      ? STALE_CHUNK_MSG
+      : `Ошибка загрузки ГИС: ${err instanceof Error ? err.message : String(err)}`;
+  }
 }
 
 async function initGis(): Promise<GisView> {
