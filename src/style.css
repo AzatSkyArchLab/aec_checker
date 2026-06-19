@@ -916,6 +916,66 @@ body {
   color: #fff;
 }
 
+/* Блок «Мой участок» — поиск и совмещение по кадастровому номеру */
+.gis-target {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.gis-target-row {
+  display: flex;
+  gap: 5px;
+  margin: 6px 0 4px;
+}
+.gis-target-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface, #2a2b30);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.gis-target-row button {
+  background: var(--surface, #2a2b30);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.gis-target-row button:hover {
+  background: var(--accent, #e8590c);
+  border-color: var(--accent, #e8590c);
+  color: #fff;
+}
+.gis-target-info {
+  color: #ffd400;
+  white-space: normal;
+  font-size: 11px;
+}
+.gis-snap {
+  width: 100%;
+  margin-top: 4px;
+  background: #ffd400;
+  color: #1a1a1a;
+  border: none;
+  border-radius: 5px;
+  padding: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.gis-snap[hidden] {
+  display: none;
+}
+.gis-snap:hover {
+  filter: brightness(1.08);
+}
+
 /* Переключатель кадастра в ГИС-топбаре */
 .gis-cad-toggle {
   display: inline-flex;

@@ -21,6 +21,7 @@ const OSM_TILES = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}
 
 const FOOTPRINT_COLOR = "#e8590c";
 const CADASTRE_COLOR = "#1f77b4";
+const TARGET_COLOR = "#ffd400";
 type Pt = [number, number];
 
 export class GisView {
@@ -43,6 +44,8 @@ export class GisView {
   /** Кэш последнего среза/центра для пере-отрисовки при изменении калибровки. */
   private lastFp: Footprint | null = null;
   private lastCenter: Pt | null = null;
+  /** Центр целевого кадастрового участка в МСК-77 (для «совместить центр»). */
+  private targetMsk: Pt | null = null;
 
   constructor(
     private mapEl: HTMLElement,
@@ -218,6 +221,15 @@ export class GisView {
       <div class="gis-info-row">Y: ${f(min[1])} … ${f(max[1])}</div>
       <div class="gis-info-row">Z: ${f(min[2])} … ${f(max[2])}</div>
       <div class="gis-info-row">вертикаль: ось ${vAxis} · срез +0.01 от низа</div>
+      <div class="gis-target">
+        <div class="gis-info-row"><b>Мой участок</b> (кад. №)</div>
+        <div class="gis-target-row">
+          <input id="gis-cadnum" type="text" placeholder="77:06:0005005:..." spellcheck="false" />
+          <button id="gis-cadfind" title="найти участок в видимой области">Найти</button>
+        </div>
+        <div id="gis-target-info" class="gis-info-row gis-target-info"></div>
+        <button id="gis-snap" class="gis-snap" hidden>Совместить центр модели ↹ участок</button>
+      </div>
       <div class="gis-calib">
         <div class="gis-info-row"><b>Калибровка к кадастру</b> <span id="gis-calib-val"></span></div>
         <div class="gis-calib-pad">
@@ -249,7 +261,68 @@ export class GisView {
         </div>
       </div>`;
     this.wireCalibControls();
+    this.wireTargetControls();
     this.updateCalibReadout();
+  }
+
+  /** Ввод кад. номера → найти участок и кнопка «совместить центр». */
+  private wireTargetControls(): void {
+    const input = this.infoEl.querySelector<HTMLInputElement>("#gis-cadnum");
+    const findBtn = this.infoEl.querySelector<HTMLButtonElement>("#gis-cadfind");
+    const snapBtn = this.infoEl.querySelector<HTMLButtonElement>("#gis-snap");
+    findBtn?.addEventListener("click", () => void this.findTargetParcel(input?.value || ""));
+    input?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.findTargetParcel(input.value);
+    });
+    snapBtn?.addEventListener("click", () => this.snapToTarget());
+  }
+
+  /** Находит участок по кад. номеру в загруженных тайлах, подсвечивает, считает центр в МСК-77. */
+  private async findTargetParcel(numRaw: string): Promise<void> {
+    const map = this.map;
+    const infoEl = this.infoEl.querySelector("#gis-target-info");
+    const snapBtn = this.infoEl.querySelector<HTMLButtonElement>("#gis-snap");
+    const num = numRaw.trim();
+    if (!map || !num) return;
+    const norm = (s: string) => s.replace(/\s+/g, "");
+    const feats = map
+      .querySourceFeatures("cadastre", { sourceLayer: CADASTRE_SRC_LAYER })
+      .filter((f) => norm(String((f.properties as any)?.cadastral_number || "")) === norm(num));
+    if (feats.length === 0) {
+      this.targetMsk = null;
+      (map.getSource("target") as maplibregl.GeoJSONSource)?.setData({ type: "FeatureCollection", features: [] });
+      if (snapBtn) snapBtn.hidden = true;
+      if (infoEl) infoEl.textContent = "не найдено в видимой области — приблизьте карту к участку";
+      return;
+    }
+    // Подсветка всех фрагментов участка + сбор точек для центроида (WGS84).
+    const fc = { type: "FeatureCollection", features: feats.map((f) => ({ type: "Feature", geometry: f.geometry, properties: {} })) };
+    (map.getSource("target") as maplibregl.GeoJSONSource).setData(fc as any);
+    let sx = 0, sy = 0, k = 0;
+    const acc = (c: number[]) => {
+      if (Number.isFinite(c[0]) && Number.isFinite(c[1])) { sx += c[0]; sy += c[1]; k++; }
+    };
+    const walk = (g: any) => {
+      if (!g) return;
+      if (g.type === "Polygon") g.coordinates.forEach((r: number[][]) => r.forEach(acc));
+      else if (g.type === "MultiPolygon") g.coordinates.forEach((p: number[][][]) => p.forEach((r) => r.forEach(acc)));
+    };
+    feats.forEach((f) => walk(f.geometry));
+    if (k === 0) return;
+    const lng = sx / k, lat = sy / k;
+    await this.ensureProj4();
+    const [e, n] = this.proj4("WGS84", MSK77, [lng, lat]) as [number, number];
+    this.targetMsk = [e, n];
+    if (snapBtn) snapBtn.hidden = false;
+    if (infoEl)
+      infoEl.textContent = `участок найден · центр МСК-77 E ${e.toFixed(1)} N ${n.toFixed(1)} (${feats.length} фрагм.)`;
+  }
+
+  /** Сдвигает калибровку так, чтобы центр модели совпал с центром целевого участка. */
+  private snapToTarget(): void {
+    if (!this.targetMsk || !this.lastCenter) return;
+    const [be, bn] = this.toMsk(this.lastCenter[0], this.lastCenter[1]);
+    this.applyCalib(this.targetMsk[0] - be, this.targetMsk[1] - bn, this.calibRot);
   }
 
   /** Навешивает обработчики на пад калибровки в инфо-панели. */
@@ -342,6 +415,20 @@ export class GisView {
 
   private addFootprintLayers(): void {
     const map = this.map!;
+    // Целевой участок — под слоем FBX, ярко-жёлтым, чтобы выделялся из синего кадастра.
+    map.addSource("target", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({
+      id: "target-fill",
+      type: "fill",
+      source: "target",
+      paint: { "fill-color": TARGET_COLOR, "fill-opacity": 0.18 },
+    });
+    map.addLayer({
+      id: "target-line",
+      type: "line",
+      source: "target",
+      paint: { "line-color": TARGET_COLOR, "line-width": 3 },
+    });
     map.addSource("footprint", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
     map.addLayer({
       id: "fp-fill",
