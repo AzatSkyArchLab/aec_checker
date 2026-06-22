@@ -108,6 +108,13 @@ export class IfcParser {
     });
   }
 
+  /** Геопривязка модели (lat/lng/поворот/масштаб) — для ГИС-диагностики. */
+  async geoReference() {
+    this.assertOpen();
+    const { getGeoReference } = await import("./geo.ts");
+    return getGeoReference(this.api, this.modelID);
+  }
+
   private toElement(expressID: number): IfcElement {
     const typeCode = this.api.GetLineType(this.modelID, expressID);
     let name: string | number | boolean | null = null;

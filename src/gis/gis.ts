@@ -53,8 +53,13 @@ export class GisView {
   private targetMsk: Pt | null = null;
   /** Кольца участка из ГПЗУ (МСК-77, X=север Y=восток). */
   private gpzuRings: GpzuPoint[][] | null = null;
-  /** Геометрия последнего FBX (для многоуровневых срезов в GIS-01). */
+  /** Геометрия последней модели (FBX/IFC) для многоуровневых срезов в GIS-01. */
   private fbx: import("./gis01.ts").FbxGeom | null = null;
+  /** Источник и геопривязка модели (для диагностики «объект вне ЗУ» в GIS-01). */
+  private modelGeo:
+    | { source: "fbx" }
+    | { source: "ifc"; ok: boolean; lat?: number; lng?: number; method?: string; inMoscow?: boolean; reason?: string }
+    | null = null;
 
   constructor(
     private mapEl: HTMLElement,
@@ -104,6 +109,7 @@ export class GisView {
         this.setStatus("В FBX не найдено геометрии");
         return;
       }
+      this.modelGeo = { source: "fbx" };
       await this.placeModel(world, file.name);
     } catch (err) {
       console.error(err);
@@ -154,6 +160,19 @@ export class GisView {
       const buf = new Uint8Array(await file.arrayBuffer());
       await parser.open(buf, { fileName: file.name, fileSize: buf.length });
       const world = ifcMeshesToWorld(parser.getMeshes());
+      // Захватываем геопривязку IFC ДО закрытия модели (для диагностики GIS-01).
+      try {
+        const geo = await parser.geoReference();
+        if (geo.ok) {
+          const { lat0, lng0, method } = geo.ref;
+          const inM = lat0 >= 55.09 && lat0 <= 56.08 && lng0 >= 36.75 && lng0 <= 38.0;
+          this.modelGeo = { source: "ifc", ok: true, lat: lat0, lng: lng0, method, inMoscow: inM };
+        } else {
+          this.modelGeo = { source: "ifc", ok: false, reason: geo.reason };
+        }
+      } catch {
+        this.modelGeo = { source: "ifc", ok: false, reason: "ошибка чтения геопривязки" };
+      }
       parser.close();
       if (world.verts === 0) {
         this.setStatus("В IFC не найдено геометрии");
@@ -303,19 +322,41 @@ export class GisView {
    */
   async runGis01(): Promise<{ status: string; summary: string; svg: string } | null> {
     if (!this.fbx) {
-      this.setStatus("GIS-01: сначала загрузите FBX-модель здания");
+      this.setStatus("GIS-01: сначала загрузите модель (FBX/IFC)");
       return null;
     }
     if (!this.gpzuRings || this.gpzuRings.length === 0) {
-      this.setStatus("GIS-01: сначала загрузите ГПЗУ (участок)");
+      this.setStatus("GIS-01: сначала загрузите ГПЗУ или DWG (границу ЗУ)");
       return null;
     }
     const { runGis01, sketchSvg } = await import("./gis01.ts");
     const ringsEN: Pt[][] = this.gpzuRings.map((r) => r.map((p) => [p.Y, p.X] as Pt)); // [east,north]
     const res = runGis01(this.fbx, ringsEN, (p) => this.toMskCal(p));
-    const svg = sketchSvg(res, {});
+
+    // Если объект ни одной точкой не попал в ЗУ — диагностируем геопривязку
+    // (детально — в эскиз/отчёт; в заголовке оставляем краткий вердикт).
+    const diagnostic = res.noOverlap ? this.geoDiagnostic() : "";
+    const svg = sketchSvg(res, { diagnostic });
     this.setStatus(`GIS-01: ${res.summary}`);
     return { status: res.status, summary: res.summary, svg };
+  }
+
+  /** Диагностика геопривязки модели для случая «объект вне ЗУ». */
+  private geoDiagnostic(): string {
+    const g = this.modelGeo;
+    if (!g) return "Источник модели неизвестен — проверьте координаты модели и ЗУ.";
+    if (g.source === "fbx") {
+      return "FBX не несёт геопривязку в МСК-77 (голая геометрия от начала координат). Если объект вне ЗУ — модель смоделирована НЕ в МСК-77 либо смещена: совместите центр и докалибруйте, либо проверьте экспорт координат.";
+    }
+    // IFC
+    if (g.ok) {
+      const coord = `${g.lat?.toFixed(5)}°, ${g.lng?.toFixed(5)}°`;
+      if (g.inMoscow) {
+        return `Проблема IFC: геопривязка (${g.method}) даёт якорь ${coord} В Москве, но геометрия модели вне ЗУ — проверьте локальные размещения (IfcLocalPlacement), единицы и смещение модели относительно базовой точки.`;
+      }
+      return `Проблема IFC: геопривязка (${g.method}) ведёт ВНЕ Москвы — якорь ${coord}. Координаты заданы в чужой СК (не МСК-77) — типично для Revit-дефолта. Нужна корректная привязка МСК-77 (IfcMapConversion/IfcProjectedCRS или IfcSite lat/lng).`;
+    }
+    return `Проблема IFC: геопривязка отсутствует/не вычислена (${g.reason}). Модель нельзя позиционировать по IFC-гео — задайте МСК-77 (IfcMapConversion + IfcProjectedCRS=МСК-77, либо IfcSite RefLatitude/RefLongitude).`;
   }
 
   private draw(fp: Footprint, centerMsk: Pt, fit = true): void {

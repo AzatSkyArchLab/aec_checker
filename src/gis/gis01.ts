@@ -37,6 +37,9 @@ export interface Gis01Result {
   baseLevel: Gis01Level | null;
   exitLevel: Gis01Level | null; // первая высота с выходом за границы
   parcelEN: Pt[]; // кольцо ЗУ [east, north]
+  noOverlap: boolean; // объект НИ ОДНОЙ точкой не попал в ЗУ (проблема координат)
+  offsetM: number; // расстояние центр объекта ↔ центр ЗУ, м
+  buildingCentroidEN: Pt | null;
 }
 
 const STEP = 1.5; // шаг срезов, м
@@ -130,9 +133,29 @@ export function runGis01(geom: FbxGeom, ringsEN: Pt[][], toMskCal: (p: Pt) => Pt
   const exitLevel = levels.find((l) => l.outside > 0) ?? null;
   const topRel = Math.round((top - base) * 100) / 100;
 
+  // Центроиды и попадания (для детекта «объект целиком вне ЗУ»).
+  let sx = 0, sy = 0, k = 0, totalInside = 0;
+  for (const l of levels) {
+    totalInside += l.insideEN.length;
+    for (const p of [...l.insideEN, ...l.outsideEN]) { sx += p[0]; sy += p[1]; k++; }
+  }
+  const buildingCentroidEN: Pt | null = k > 0 ? [sx / k, sy / k] : null;
+  const parcelC = centroidOf(parcelEN);
+  const offsetM =
+    buildingCentroidEN && parcelC
+      ? Math.round(Math.hypot(buildingCentroidEN[0] - parcelC[0], buildingCentroidEN[1] - parcelC[1]))
+      : 0;
+  const dist = offsetM >= 1000 ? `${(offsetM / 1000).toFixed(1)} км` : `${offsetM} м`;
+
   let status: Gis01Result["status"];
   let summary: string;
-  if (!exitLevel) {
+  let noOverlap = false;
+  if (k > 0 && totalInside === 0) {
+    // Ни одна точка ни на одной высоте не попала в ЗУ — проблема координат/привязки.
+    status = "fail";
+    noOverlap = true;
+    summary = `Объект ПОЛНОСТЬЮ вне границ ЗУ — нет ни одной точки внутри (центр объекта ~${dist} от центра участка). Вероятна проблема геопривязки/координат.`;
+  } else if (!exitLevel) {
     status = "pass";
     summary = `Здание полностью в границах ЗУ (проверено ${levels.length} ур. до ${topRel} м).`;
   } else if (baseLevel && baseLevel.outside > 0) {
@@ -142,17 +165,46 @@ export function runGis01(geom: FbxGeom, ringsEN: Pt[][], toMskCal: (p: Pt) => Pt
     status = "warn";
     summary = `Нижняя часть в пределах ЗУ; с высоты ${exitLevel.hRel} м часть выступает за границы ЗУ (${exitLevel.outside} точек).`;
   }
-  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN };
+  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN, noOverlap, offsetM, buildingCentroidEN };
+}
+
+function centroidOf(ring: Pt[]): Pt | null {
+  if (ring.length === 0) return null;
+  let sx = 0, sy = 0;
+  for (const p of ring) { sx += p[0]; sy += p[1]; }
+  return [sx / ring.length, sy / ring.length];
+}
+
+function wrapText(s: string, n: number): string[] {
+  if (!s) return [];
+  const words = s.split(/\s+/);
+  const lines: string[] = [];
+  let cur = "";
+  for (const w of words) {
+    if ((cur + " " + w).trim().length > n) {
+      if (cur) lines.push(cur);
+      cur = w;
+    } else {
+      cur = (cur + " " + w).trim();
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+function escXml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 // ── Эскиз (вид сверху) ───────────────────────────────────────────────────────
 
 /** SVG-эскиз вид сверху: ЗУ + срез основания + срез на высоте выхода (выступающие — красным). */
-export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string }): string {
+export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string; diagnostic?: string }): string {
   const W = 760, H = 620, pad = 36;
   const all: Pt[] = [...res.parcelEN];
   if (res.baseLevel) all.push(...res.baseLevel.insideEN, ...res.baseLevel.outsideEN);
   if (res.exitLevel) all.push(...res.exitLevel.insideEN, ...res.exitLevel.outsideEN);
+  if (res.buildingCentroidEN) all.push(res.buildingCentroidEN);
   if (all.length === 0) return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}"></svg>`;
 
   let minE = Infinity, maxE = -Infinity, minN = Infinity, maxN = -Infinity;
@@ -178,6 +230,22 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
   const barLen = 10 * s;
   const bx = pad, by = H - 16;
 
+  // Для «объект вне ЗУ» — пунктир от центра участка к центру объекта + расстояние.
+  const parcelC = centroidOf(res.parcelEN);
+  const bC = res.buildingCentroidEN;
+  const connector =
+    res.noOverlap && parcelC && bC
+      ? `<line x1="${X(parcelC[0]).toFixed(1)}" y1="${Y(parcelC[1]).toFixed(1)}" x2="${X(bC[0]).toFixed(1)}" y2="${Y(bC[1]).toFixed(1)}" stroke="#c0392b" stroke-width="1.3" stroke-dasharray="6 4"/>` +
+        `<circle cx="${X(bC[0]).toFixed(1)}" cy="${Y(bC[1]).toFixed(1)}" r="4" fill="#c0392b"/>` +
+        `<text x="${((X(parcelC[0]) + X(bC[0])) / 2).toFixed(1)}" y="${((Y(parcelC[1]) + Y(bC[1])) / 2 - 5).toFixed(1)}" font-size="11" fill="#c0392b" text-anchor="middle">~${res.offsetM >= 1000 ? (res.offsetM / 1000).toFixed(1) + " км" : res.offsetM + " м"} (объект вне ЗУ)</text>`
+      : "";
+  // Диагностика геопривязки (перенос строк, белая подложка для читаемости).
+  const diagLines = wrapText(opts?.diagnostic || "", 95).slice(0, 4);
+  const diagSvg = diagLines.length
+    ? `<rect x="${pad - 4}" y="46" width="${W - 2 * pad + 8}" height="${diagLines.length * 15 + 8}" fill="#ffffff" fill-opacity="0.85"/>` +
+      diagLines.map((ln, i) => `<text x="${pad}" y="${60 + i * 15}" font-size="11" fill="#7a2018">${escXml(ln)}</text>`).join("")
+    : "";
+
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="Arial, sans-serif">
   <rect width="${W}" height="${H}" fill="#ffffff"/>
   <text x="${pad}" y="22" font-size="15" font-weight="bold" fill="#222">GIS-01 · Здание в границах ЗУ — вид сверху</text>
@@ -187,6 +255,8 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
   ${res.baseLevel ? dots(res.baseLevel.insideEN, "#1f9d55", 1.7) : ""}
   ${res.exitLevel ? dots(res.exitLevel.insideEN, "#9aa0a6", 1.4) : ""}
   ${res.exitLevel ? dots(res.exitLevel.outsideEN, "#e2241a", 2.4) : ""}
+  ${connector}
+  ${diagSvg}
   <g font-size="11" fill="#333">
     <rect x="${pad}" y="${H - 92}" width="14" height="10" fill="#16a34a" fill-opacity="0.25" stroke="#16a34a"/>
     <text x="${pad + 20}" y="${H - 83}">граница ЗУ (ГПЗУ, МСК-77)</text>
