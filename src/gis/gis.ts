@@ -233,10 +233,16 @@ export class GisView {
       this.gpzuRings = res.rings.map((r) => r.pts.map(toGpzu));
       this.drawGpzu(true);
       const npts = this.gpzuRings.reduce((s, r) => s + r.length, 0);
+      // Какие слои ещё похожи на ЗУ (для контроля/выбора, пока имена не унифицированы).
+      const others = res.candidates
+        .filter((c) => c.score > 0 && c.layer !== res.chosenLayer)
+        .slice(0, 4)
+        .map((c) => `${c.layer}(${c.score})`);
       const layerInfo = res.matchedByLayer
-        ? `слой «${res.rings[0].layer}»`
-        : `крупнейший контур (слой ЗУ не распознан${res.allLayers.length ? "; слои: " + res.allLayers.slice(0, 5).join(", ") : ""})`;
-      this.setStatus(`DWG: ${file.name} · ${layerInfo} · точек: ${npts}`);
+        ? `слой «${res.chosenLayer}»`
+        : `крупнейший контур (слой ЗУ не распознан — проверьте «${res.chosenLayer}»)`;
+      const hint = others.length ? ` · др. кандидаты: ${others.join(", ")}` : "";
+      this.setStatus(`DWG: ${file.name} · ${layerInfo} · точек: ${npts}${hint}`);
     } catch (err) {
       console.error(err);
       this.setStatus(`Ошибка чтения DWG: ${(err as Error).message}`);
