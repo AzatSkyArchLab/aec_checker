@@ -15,6 +15,10 @@ import type { FbxGeom } from "./gis01.ts";
  */
 const MSK77 =
   "+proj=tmerc +lat_0=55.66666666666667 +lon_0=37.5 +k=1 +x_0=0 +y_0=0 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +units=m +no_defs";
+// Пулково-1942 географические (EPSG:4284): lat/lng визуально как WGS84, но на
+// датуме Красовского — расходятся с WGS84 на ~110–120 м по Москве. Городские
+// данные (Мосдата/НСПД) часто отдают именно так → опция датума для красных линий.
+const PULKOVO_GEO = "+proj=longlat +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +no_defs";
 
 // Кадастр: MVT-сервер metatiler (Swagger /tiles/{layer}/{z}/{x}/{y}); 101 = кадастр Москвы.
 const METATILER_BASE = "https://meta-tiler-stage.metapolis.su";
@@ -104,6 +108,10 @@ export class GisView {
   private calibPivot: Pt | null = null;
   /** Центр целевого участка (кадастр/ГПЗУ) в МСК-77 (для «совместить центр»). */
   private targetMsk: Pt | null = null;
+  /** Цель задана пользователем (поиск по кад.№) — не перетирать центром границы. */
+  private targetIsUserPicked = false;
+  /** Датум красных линий: как в файле (WGS84) или Пулково-1942/МСК-77 (+датум-сдвиг). */
+  private redlinesDatum: "wgs84" | "pulkovo" = "wgs84";
   /** Загруженные модели зданий (FBX/IFC) — все рисуются и проверяются одновременно. */
   private models: PlacedModel[] = [];
   /** Загруженные границы ЗУ (ГПЗУ/DWG) — объединение участвует в GIS-01. */
@@ -241,7 +249,9 @@ export class GisView {
     const parser = new IfcParser();
     const buf = new Uint8Array(await file.arrayBuffer());
     await parser.open(buf, { fileName: file.name, fileSize: buf.length });
-    const world = ifcMeshesToWorld(parser.getMeshes());
+    const meshes = parser.getMeshes();
+    // Геопривязку считаем ДО мутации мешей: geoReference()→computeFootprint(this.meshes,
+    // this.offset) ожидает рецентрированные позиции, иначе offset задвоится.
     let geo: ModelGeo;
     try {
       const g = await parser.geoReference();
@@ -255,6 +265,20 @@ export class GisView {
     } catch {
       geo = { source: "ifc", ok: false, reason: "ошибка чтения геопривязки" };
     }
+    // getMeshes рецентрирует геометрию к центру bbox (float32-точность); вернём
+    // мировые координаты IFC (мэш + offset) — для ЦИМ АГР это МСК-77, тогда модель
+    // встаёт на место без ручного совмещения (как FBX). offset float64 → значения
+    // ~десятки тыс. м, точность float32 ~мм — достаточно для среза.
+    const off = parser.getModelOffset();
+    for (const m of meshes) {
+      const p = m.positions;
+      for (let i = 0; i + 2 < p.length; i += 3) {
+        p[i] += off.x;
+        p[i + 1] += off.y;
+        p[i + 2] += off.z;
+      }
+    }
+    const world = ifcMeshesToWorld(meshes);
     parser.close();
     if (world.verts === 0) throw new Error("в IFC не найдено геометрии");
     this.addModel(world, file.name, "ifc", geo);
@@ -355,11 +379,44 @@ export class GisView {
     this.setRedLinesVisible(true);
   }
 
-  /** Пересобирает client-side слой красных линий из всех загруженных наборов. */
+  /** Пересобирает client-side слой красных линий из всех наборов (с учётом датума). */
   private rebuildRedlines(): void {
     const src = this.map?.getSource("redlines-local") as maplibregl.GeoJSONSource | undefined;
     if (!src) return;
-    src.setData({ type: "FeatureCollection", features: this.redlineSets.flatMap((s) => s.features) } as any);
+    const raw = this.redlineSets.flatMap((s) => s.features);
+    const features =
+      this.redlinesDatum === "pulkovo" && this.proj4 ? raw.map((f) => this.reprojectRedline(f)) : raw;
+    src.setData({ type: "FeatureCollection", features } as any);
+  }
+
+  /** Координата красной линии → WGS84 для карты (с учётом выбранного датума). */
+  private redlineLngLat(c: [number, number]): [number, number] {
+    if (this.redlinesDatum === "pulkovo" && this.proj4) return this.proj4(PULKOVO_GEO, "WGS84", c) as [number, number];
+    return c;
+  }
+
+  /** Глубокая репроекция geometry красной линии Пулково-1942 → WGS84 (без мутации исходника). */
+  private reprojectRedline(f: any): any {
+    const tx = (c: any): any =>
+      Array.isArray(c) && typeof c[0] === "number"
+        ? this.proj4(PULKOVO_GEO, "WGS84", c)
+        : Array.isArray(c)
+          ? c.map(tx)
+          : c;
+    const g = f?.geometry;
+    if (!g?.coordinates) return f;
+    return { ...f, geometry: { ...g, coordinates: tx(g.coordinates) } };
+  }
+
+  /** Переключает датум красных линий (WGS84 ↔ Пулково-1942/МСК-77) и пере-рисовывает. */
+  async setRedlinesDatum(d: "wgs84" | "pulkovo"): Promise<void> {
+    if (d === this.redlinesDatum) return;
+    this.redlinesDatum = d;
+    await this.ensureProj4();
+    this.rebuildRedlines();
+    // если кроме линий ничего не загружено — переедем к ним (они сдвинулись)
+    if (this.models.length === 0 && this.boundaries.length === 0) this.redrawAll(true);
+    this.setStatus(`Красные линии · датум: ${d === "pulkovo" ? "Пулково-1942/МСК-77 (+сдвиг)" : "WGS84 (как в файле)"}`);
   }
 
   /** Авто-детект оси DWG→МСК-77: пробуем обе ориентации, берём попадание в Москву. */
@@ -376,7 +433,6 @@ export class GisView {
     return (p) => ({ X: p.y, Y: p.x }); // дефолт A: north=y, east=x
   }
 
-  /** Рисует участок ГПЗУ (МСК-77 → WGS84 тем же proj4, что FBX) и делает его целью совмещения. */
   /** Пере-рисовывает всё (модели + границы) и при fit масштабирует на весь набор. */
   private redrawAll(fit: boolean): void {
     if (!this.map) return;
@@ -384,6 +440,17 @@ export class GisView {
     const bounds = new maplibregl.LngLatBounds();
     this.drawModels(bounds);
     this.drawBoundaries(bounds);
+    // Если кроме красных линий ничего нет — учтём их в bounds, чтобы fit показал их.
+    if (this.models.length === 0 && this.boundaries.length === 0) {
+      for (const s of this.redlineSets)
+        for (const f of s.features) {
+          const g = (f as { geometry?: { coordinates?: unknown } })?.geometry;
+          walkLeafCoords(g?.coordinates, (c) => {
+            const ll = this.redlineLngLat(c);
+            if (Number.isFinite(ll[0]) && Math.abs(ll[1]) <= 90) bounds.extend(ll as [number, number]);
+          });
+        }
+    }
     if (fit && !bounds.isEmpty()) this.map.fitBounds(bounds, { padding: 70, maxZoom: 19, duration: 0 });
     this.map.resize();
   }
@@ -471,12 +538,19 @@ export class GisView {
     }
     (map.getSource("gpzu") as maplibregl.GeoJSONSource).setData({ type: "FeatureCollection", features } as any);
 
+    // Цель «совместить центр»: пользовательский выбор (поиск по кад.№) приоритетнее
+    // и не перетирается; иначе — центр крупнейшей границы (или сброс, если границ нет).
+    if (this.targetIsUserPicked) return;
+    const snapBtn = this.infoEl.querySelector<HTMLButtonElement>("#gis-snap");
+    const tInfo = this.infoEl.querySelector("#gis-target-info");
     if (best) {
       this.targetMsk = best.c; // [east, north]
-      const snapBtn = this.infoEl.querySelector<HTMLButtonElement>("#gis-snap");
       if (snapBtn) snapBtn.hidden = false;
-      const tInfo = this.infoEl.querySelector("#gis-target-info");
       if (tInfo) tInfo.textContent = `Цель: участок ЗУ, центр МСК-77 E ${best.c[0].toFixed(1)} N ${best.c[1].toFixed(1)}`;
+    } else {
+      this.targetMsk = null;
+      if (snapBtn) snapBtn.hidden = true;
+      if (tInfo) tInfo.textContent = "";
     }
   }
 
@@ -496,6 +570,9 @@ export class GisView {
     this.models.forEach((m, i) => (m.color = MODEL_PALETTE[i % MODEL_PALETTE.length]));
     this.redrawAll(false);
     this.renderPanel();
+    // если всё удалили — вернём центральную зону-приёмник файлов
+    if (this.models.length === 0 && this.boundaries.length === 0 && this.redlineSets.length === 0)
+      this.dropzone.classList.remove("hidden");
     this.setStatus("Элемент удалён");
   }
 
@@ -611,6 +688,17 @@ export class GisView {
       ? items.join("")
       : `<div class="gis-empty">Перетащите файлы (IFC / DWG / FBX / PDF / GeoJSON) или «Открыть файлы»</div>`;
 
+    // Датум красных линий: городские выгрузки (Мосдата/НСПД) часто в Пулково-1942 —
+    // тогда они «уезжают» ~110 м, если читать как WGS84. Переключатель чинит это.
+    const redlinesDatumHtml = this.redlineSets.length
+      ? `<label class="gis-rl-datum">Красные линии — датум:
+          <select id="gis-rl-datum">
+            <option value="wgs84"${this.redlinesDatum === "wgs84" ? " selected" : ""}>WGS84 (как в файле)</option>
+            <option value="pulkovo"${this.redlinesDatum === "pulkovo" ? " selected" : ""}>Пулково-1942 / МСК-77 (+сдвиг ~110 м)</option>
+          </select>
+        </label>`
+      : "";
+
     const checkRows = (this.lastChecks || [])
       .map(
         (c) => `<div class="gis-check-item">
@@ -628,6 +716,7 @@ export class GisView {
       <div class="gis-panel-sec">
         <div class="gis-panel-head"><b>Загруженные данные</b></div>
         <div class="gis-items">${itemsHtml}</div>
+        ${redlinesDatumHtml}
       </div>
       <div class="gis-panel-sec">
         <div class="gis-panel-head"><b>Проверки</b></div>
@@ -639,6 +728,9 @@ export class GisView {
       btn.addEventListener("click", () => this.removeItem(btn.dataset.del!)),
     );
     this.infoEl.querySelector<HTMLButtonElement>("#gis-run-checks")?.addEventListener("click", () => this.onShowChecks?.());
+    this.infoEl.querySelector<HTMLSelectElement>("#gis-rl-datum")?.addEventListener("change", (e) =>
+      void this.setRedlinesDatum((e.target as HTMLSelectElement).value as "wgs84" | "pulkovo"),
+    );
     if (hasModels) {
       this.wireCalibControls();
       this.wireTargetControls();
@@ -731,6 +823,7 @@ export class GisView {
       .filter((f) => norm(String((f.properties as any)?.cadastral_number || "")) === norm(num));
     if (feats.length === 0) {
       this.targetMsk = null;
+      this.targetIsUserPicked = false;
       (map.getSource("target") as maplibregl.GeoJSONSource)?.setData({ type: "FeatureCollection", features: [] });
       if (snapBtn) snapBtn.hidden = true;
       if (infoEl) infoEl.textContent = "не найдено в видимой области — приблизьте карту к участку";
@@ -754,6 +847,7 @@ export class GisView {
     await this.ensureProj4();
     const [e, n] = this.proj4("WGS84", MSK77, [lng, lat]) as [number, number];
     this.targetMsk = [e, n];
+    this.targetIsUserPicked = true; // приоритетнее центра границы — не перетирать при redraw
     if (snapBtn) snapBtn.hidden = false;
     if (infoEl)
       infoEl.textContent = `участок найден · центр МСК-77 E ${e.toFixed(1)} N ${n.toFixed(1)} (${feats.length} фрагм.)`;
@@ -1005,6 +1099,11 @@ function centroidEN(ring: Pt[]): Pt | null {
   let sx = 0, sy = 0;
   for (const p of ring) { sx += p[0]; sy += p[1]; }
   return [sx / ring.length, sy / ring.length];
+}
+/** Рекурсивно обходит координаты GeoJSON-геометрии, вызывая fn на каждой паре [x,y]. */
+function walkLeafCoords(c: unknown, fn: (p: [number, number]) => void): void {
+  if (Array.isArray(c) && typeof c[0] === "number") fn(c as [number, number]);
+  else if (Array.isArray(c)) for (const x of c) walkLeafCoords(x, fn);
 }
 
 // ── Геометрия FBX ────────────────────────────────────────────────────────────

@@ -1122,6 +1122,22 @@ body {
   line-height: 1.5;
   padding: 2px 0;
 }
+.gis-rl-datum {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.gis-rl-datum select {
+  background: var(--surface, #2a2b30);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 11px;
+}
 .gis-run-checks {
   width: 100%;
   background: var(--accent, #e8590c);
