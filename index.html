@@ -116,26 +116,10 @@
             <input id="gis-redlines" type="checkbox" checked />
             Красные линии
           </label>
-          <button id="gis01-run" class="btn" title="GIS-01: здание в границах ЗУ (нужны ГПЗУ + FBX)">Проверка GIS-01</button>
-          <label class="btn">
-            Открыть ГПЗУ
-            <input id="gis-gpzu" type="file" accept=".pdf" hidden />
-          </label>
-          <label class="btn">
-            Открыть DWG
-            <input id="gis-dwg" type="file" accept=".dwg" hidden />
-          </label>
-          <label class="btn">
-            Красные линии
-            <input id="gis-redlines-file" type="file" accept=".geojson,.json" hidden />
-          </label>
-          <label class="btn">
-            Открыть FBX
-            <input id="gis-file" type="file" accept=".fbx" hidden />
-          </label>
-          <label class="btn">
-            Открыть IFC
-            <input id="gis-ifc" type="file" accept=".ifc" hidden />
+          <button id="gis01-run" class="btn" title="GIS-01: здание в границах ЗУ (нужны модель + граница ЗУ)">Проверка GIS-01</button>
+          <label class="btn btn-primary">
+            Открыть файлы
+            <input id="gis-files" type="file" accept=".fbx,.ifc,.dwg,.pdf,.geojson,.json" multiple hidden />
           </label>
         </div>
       </header>
@@ -144,8 +128,8 @@
         <div id="gis-dropzone" class="dropzone">
           <div class="dropzone-inner">
             <div class="dropzone-icon">⬇</div>
-            <div class="dropzone-text">Перетащите <b>.fbx</b> / <b>.ifc</b> (модель) или <b>.pdf</b> (ГПЗУ) / <b>.dwg</b> (участок)</div>
-            <div class="dropzone-hint">Модель (FBX/IFC) → нижний срез на карту; ГПЗУ/DWG → граница ЗУ (МСК-77)</div>
+            <div class="dropzone-text">Перетащите файлы проекта сюда — можно несколько сразу</div>
+            <div class="dropzone-hint"><b>IFC / FBX</b> → модель · <b>DWG / PDF-ГПЗУ</b> → граница ЗУ · <b>GeoJSON</b> → красные линии</div>
           </div>
         </div>
         <div id="gis-info" class="gis-info" hidden></div>
@@ -155,16 +139,13 @@
         <div class="map-dialog gis01-dialog">
           <div class="map-head">
             <div class="map-titles">
-              <span class="map-title">GIS-01 · Здание в границах ЗУ</span>
+              <span class="map-title">GIS-01 · Здание в границах ЗУ — по каждой модели</span>
               <span id="gis01-verdict" class="map-method"></span>
             </div>
-            <div class="gis01-actions">
-              <button id="gis01-download" class="tool-btn" title="Скачать эскиз (PNG)">⬇ Эскиз PNG</button>
-              <button id="gis01-close" class="map-close" aria-label="Закрыть">✕</button>
-            </div>
+            <button id="gis01-close" class="map-close" aria-label="Закрыть">✕</button>
           </div>
           <div class="map-body">
-            <div id="gis01-sketch" class="gis01-sketch"></div>
+            <div id="gis01-cards" class="gis01-cards"></div>
           </div>
         </div>
       </div>

@@ -356,25 +356,12 @@ async function initGis(): Promise<GisView> {
     $<HTMLInputElement>("#gis-cadastre"),
     $<HTMLInputElement>("#gis-redlines"),
   );
-  $<HTMLInputElement>("#gis-file").addEventListener("change", (e) => {
-    const f = (e.target as HTMLInputElement).files?.[0];
-    if (f) void view.loadFbx(f);
-  });
-  $<HTMLInputElement>("#gis-gpzu").addEventListener("change", (e) => {
-    const f = (e.target as HTMLInputElement).files?.[0];
-    if (f) void view.openGpzu(f);
-  });
-  $<HTMLInputElement>("#gis-dwg").addEventListener("change", (e) => {
-    const f = (e.target as HTMLInputElement).files?.[0];
-    if (f) void view.openDwg(f);
-  });
-  $<HTMLInputElement>("#gis-ifc").addEventListener("change", (e) => {
-    const f = (e.target as HTMLInputElement).files?.[0];
-    if (f) void view.openIfc(f);
-  });
-  $<HTMLInputElement>("#gis-redlines-file").addEventListener("change", (e) => {
-    const f = (e.target as HTMLInputElement).files?.[0];
-    if (f) void view.openRedLines(f);
+  // Единый загрузчик: один input на все типы (multiple) + drop любого микса файлов.
+  const filesInput = $<HTMLInputElement>("#gis-files");
+  filesInput.addEventListener("change", (e) => {
+    const files = Array.from((e.target as HTMLInputElement).files || []);
+    if (files.length) void view.openFiles(files);
+    filesInput.value = ""; // позволяем выбрать те же файлы повторно
   });
   const gbody = $<HTMLElement>(".gis-body");
   const gdrop = $<HTMLElement>("#gis-dropzone");
@@ -386,37 +373,61 @@ async function initGis(): Promise<GisView> {
   gbody.addEventListener("drop", (e) => {
     e.preventDefault();
     gdrop.classList.remove("dragging");
-    const f = e.dataTransfer?.files?.[0];
-    if (!f) return;
-    const name = f.name.toLowerCase();
-    if (name.endsWith(".fbx")) void view.loadFbx(f);
-    else if (name.endsWith(".ifc")) void view.openIfc(f);
-    else if (name.endsWith(".pdf")) void view.openGpzu(f);
-    else if (name.endsWith(".dwg")) void view.openDwg(f);
-    else if (name.endsWith(".geojson") || name.endsWith(".json")) void view.openRedLines(f);
+    const files = Array.from(e.dataTransfer?.files || []);
+    if (files.length) void view.openFiles(files);
   });
 
-  // ── Проверка GIS-01: здание в границах ЗУ ──────────────────────────────────
+  // ── Проверка GIS-01: вердикт по КАЖДОЙ модели ──────────────────────────────
   const gis01Modal = $<HTMLElement>("#gis01-modal");
   const gis01Verdict = $<HTMLElement>("#gis01-verdict");
-  const gis01Sketch = $<HTMLElement>("#gis01-sketch");
-  let gis01Svg = "";
-  $("#gis01-run").addEventListener("click", () => {
-    void view.runGis01().then((res) => {
-      if (!res) return; // статус-сообщение уже показано (нет ГПЗУ/FBX)
-      gis01Svg = res.svg;
-      gis01Verdict.textContent = res.summary;
-      gis01Verdict.className = `map-method status-${res.status}`;
-      gis01Sketch.innerHTML = res.svg;
-      gis01Modal.hidden = false;
-    });
-  });
+  const gis01Cards = $<HTMLElement>("#gis01-cards");
+  const runChecks = (): void => {
+    const out = view.runAllChecks();
+    if (!out) return; // статус-сообщение уже показано (нет модели/ЗУ)
+    const { perModel, counts } = out;
+    gis01Verdict.textContent = `моделей: ${perModel.length} · ✓ ${counts.pass} · ⚠ ${counts.warn} · ✗ ${counts.fail}`;
+    gis01Verdict.className = `map-method status-${counts.fail ? "fail" : counts.warn ? "warn" : "pass"}`;
+    gis01Cards.innerHTML = "";
+    for (const r of perModel) {
+      const card = document.createElement("div");
+      card.className = "gis01-card";
+
+      const head = document.createElement("div");
+      head.className = "gis01-card-head";
+      const dot = document.createElement("span");
+      dot.className = "gis01-dot";
+      dot.style.background = r.color;
+      const nm = document.createElement("span");
+      nm.className = "gis01-card-name";
+      nm.textContent = r.name;
+      const bd = document.createElement("span");
+      bd.className = `gis01-card-badge status-${r.status}`;
+      bd.textContent = r.status === "pass" ? "✓ соответствие" : r.status === "warn" ? "⚠ частично" : "✗ не соответствие";
+      head.append(dot, nm, bd);
+
+      const summary = document.createElement("div");
+      summary.className = "gis01-card-summary";
+      summary.textContent = r.summary;
+
+      const sketch = document.createElement("div");
+      sketch.className = "gis01-sketch";
+      sketch.innerHTML = r.svg;
+
+      const dl = document.createElement("button");
+      dl.className = "tool-btn gis01-card-dl";
+      dl.textContent = "⬇ Эскиз PNG";
+      dl.addEventListener("click", () => downloadSvgAsPng(r.svg, `GIS-01_${r.name.replace(/\.[^.]+$/, "")}.png`));
+
+      card.append(head, summary, sketch, dl);
+      gis01Cards.appendChild(card);
+    }
+    gis01Modal.hidden = false;
+  };
+  $("#gis01-run").addEventListener("click", runChecks);
+  view.setChecksViewer(runChecks); // кнопка «GIS-01» в левой панели открывает тот же отчёт
   $("#gis01-close").addEventListener("click", () => (gis01Modal.hidden = true));
   gis01Modal.addEventListener("click", (e) => {
     if (e.target === gis01Modal) gis01Modal.hidden = true;
-  });
-  $("#gis01-download").addEventListener("click", () => {
-    if (gis01Svg) downloadSvgAsPng(gis01Svg, "GIS-01_эскиз.png");
   });
   return view;
 }

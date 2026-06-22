@@ -4,6 +4,7 @@ import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import type { GpzuPoint } from "./gpzu.ts";
 import { classifyRings, runGis01 as runGis01Calc, sketchSvg } from "./gis01.ts";
+import type { FbxGeom } from "./gis01.ts";
 
 /**
  * ГИС-режим: FBX в МСК-77 → нижний срез модели → точки на карте «как в FBX»,
@@ -28,39 +29,92 @@ const FOOTPRINT_COLOR = "#e8590c";
 const CADASTRE_COLOR = "#1f77b4";
 const TARGET_COLOR = "#ffd400";
 const GPZU_COLOR = "#16a34a"; // зелёный — авторитетный участок из ГПЗУ (МСК-77)
+// Палитра для нескольких моделей одновременно (цветокодировка контуров на карте).
+const MODEL_PALETTE = ["#e8590c", "#7048e8", "#0ca678", "#e64980", "#1098ad", "#f08c00", "#4263eb", "#ae3ec9"];
 type Pt = [number, number];
+
+/** Геопривязка модели (для диагностики «объект вне ЗУ» в GIS-01). */
+type ModelGeo =
+  | { source: "fbx" }
+  | { source: "ifc"; ok: boolean; lat?: number; lng?: number; method?: string; inMoscow?: boolean; reason?: string };
+
+/** Размещённая на карте модель здания (FBX или IFC). Несколько сосуществуют. */
+interface PlacedModel {
+  id: string;
+  name: string;
+  kind: "fbx" | "ifc";
+  geom: FbxGeom; // для многоуровневых срезов GIS-01
+  geo: ModelGeo;
+  footprint: Footprint; // нижний срез в координатах модели (hA,hB)
+  center: Pt; // центр модели [hA,hB] (для маркера и оси доворота)
+  color: string;
+  info: string; // краткая строка для панели
+}
+
+/** Граница ЗУ (из ГПЗУ или DWG). Несколько сосуществуют; GIS-01 берёт объединение. */
+interface Boundary {
+  id: string;
+  name: string;
+  kind: "gpzu" | "dwg";
+  rings: GpzuPoint[][]; // МСК-77, X=север Y=восток (один участок: внешний+дырки/мультиконтур)
+  info: string; // краткая строка для панели
+  ok: boolean; // распознано/геопривязка вменяемая
+}
+
+/** Набор красных линий из GeoJSON (WGS84), временно client-side. */
+interface RedLineSet {
+  id: string;
+  name: string;
+  n: number;
+  features: unknown[];
+}
+
+/** Результат GIS-01 по одной модели — для модалки и панели. */
+export interface ModelCheckResult {
+  modelId: string;
+  name: string;
+  color: string;
+  status: "pass" | "warn" | "fail";
+  summary: string;
+  diagnostic: string;
+  svg: string;
+}
 
 export class GisView {
   private map: maplibregl.Map | null = null;
   private ready: Promise<void> | null = null;
   private proj4: any = null;
-  private centerMarker: maplibregl.Marker | null = null;
-  /** (горизонт. координаты среза) → (east, north) МСК-77. */
-  private toMsk: (a: number, b: number) => Pt = (a, b) => [a, b];
+  private markers: maplibregl.Marker[] = [];
+  /**
+   * (горизонт. координаты среза) → (east, north) МСК-77. FBXLoader и web-ifc дают
+   * Y-up: ось0=East, ось2=−North — единая конвенция для всех моделей (константа).
+   */
+  private toMsk = (a: number, b: number): Pt => [a, -b];
   /**
    * Ручная калибровка сдвига в МСК-77 (м): ΔВосток, ΔСевер. Кадастр (НСПД,
    * индикативный) и FBX (привязан к точной выписке) расходятся на десятки
-   * метров — этот сдвиг дотягивает модель до кадастра. Применяется до proj4,
+   * метров — этот сдвиг дотягивает модели до кадастра. Применяется до proj4,
    * т.е. полностью в кадре МСК-77. Хранится в localStorage (один на все модели).
    */
   private calibE = 0;
   private calibN = 0;
-  /** Доворот FBX вокруг центра модели (град) — убирает остаточный поворот. */
+  /** Доворот вокруг общего центра моделей (град) — убирает остаточный поворот. */
   private calibRot = 0;
-  /** Кэш последнего среза/центра для пере-отрисовки при изменении калибровки. */
-  private lastFp: Footprint | null = null;
-  private lastCenter: Pt | null = null;
+  /** Общий центр всех моделей в МСК-77 (raw, до калибровки) — ось доворота. */
+  private calibPivot: Pt | null = null;
   /** Центр целевого участка (кадастр/ГПЗУ) в МСК-77 (для «совместить центр»). */
   private targetMsk: Pt | null = null;
-  /** Кольца участка из ГПЗУ (МСК-77, X=север Y=восток). */
-  private gpzuRings: GpzuPoint[][] | null = null;
-  /** Геометрия последней модели (FBX/IFC) для многоуровневых срезов в GIS-01. */
-  private fbx: import("./gis01.ts").FbxGeom | null = null;
-  /** Источник и геопривязка модели (для диагностики «объект вне ЗУ» в GIS-01). */
-  private modelGeo:
-    | { source: "fbx" }
-    | { source: "ifc"; ok: boolean; lat?: number; lng?: number; method?: string; inMoscow?: boolean; reason?: string }
-    | null = null;
+  /** Загруженные модели зданий (FBX/IFC) — все рисуются и проверяются одновременно. */
+  private models: PlacedModel[] = [];
+  /** Загруженные границы ЗУ (ГПЗУ/DWG) — объединение участвует в GIS-01. */
+  private boundaries: Boundary[] = [];
+  /** Загруженные наборы красных линий (GeoJSON, client-side). */
+  private redlineSets: RedLineSet[] = [];
+  private seq = 0;
+  /** Последний прогон GIS-01 (для перерисовки панели). */
+  private lastChecks: ModelCheckResult[] | null = null;
+  /** Колбэк «показать отчёт проверок» (модалку открывает main.ts). */
+  private onShowChecks: (() => void) | null = null;
 
   constructor(
     private mapEl: HTMLElement,
@@ -95,203 +149,217 @@ export class GisView {
   /** Поднимает карту (basemap + кадастр) — вызывается при входе в ГИС. */
   open(): void {
     void this.ensureMap();
+    this.renderPanel();
   }
 
-  /** Загружает FBX, режет низ модели, проецирует в WGS84, кладёт точки на карту. */
-  async loadFbx(file: File): Promise<void> {
-    this.setStatus(`Чтение «${file.name}»…`);
-    this.dropzone.classList.add("hidden");
-    try {
-      const buf = await file.arrayBuffer();
-      const group = new FBXLoader().parse(buf, "");
-      group.updateMatrixWorld(true);
-      const world = collectWorld(group);
-      if (world.verts === 0) {
-        this.setStatus("В FBX не найдено геометрии");
-        return;
-      }
-      this.modelGeo = { source: "fbx" };
-      await this.placeModel(world, file.name);
-    } catch (err) {
-      console.error(err);
-      this.setStatus("Ошибка загрузки FBX");
-      this.dropzone.classList.remove("hidden");
-    }
+  /** main.ts задаёт колбэк открытия отчёта проверок (модалка с эскизами по каждой модели). */
+  setChecksViewer(cb: () => void): void {
+    this.onShowChecks = cb;
   }
 
   /**
-   * Общая укладка модели (FBX или IFC) на карту: оба источника дают геометрию
-   * в Y-up (FBXLoader и web-ifc), поэтому ось/срез/калибровка/GIS-01 — единые.
+   * Единый загрузчик: принимает любой микс файлов (FBX/IFC/DWG/PDF/GeoJSON),
+   * определяет тип по расширению, обрабатывает по очереди и кладёт всё на карту
+   * одновременно (модели — цветокодированные срезы, ЗУ — зелёным, кр. линии — красным).
    */
-  private async placeModel(
-    world: { meshes: WorldMesh[]; min: number[]; max: number[]; verts: number; tris: number },
-    fileName: string,
-  ): Promise<void> {
-    const { meshes, min, max, verts, tris } = world;
-    const center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
-    // FBXLoader и web-ifc отдают Y-up → вертикаль всегда ось1 (надёжнее эвристики
-    // по |center|, которая ломалась для моделей у начала координат).
-    const vAxis = 1;
-    const [hA, hB] = [0, 2] as [number, number];
-
-    await this.ensureProj4();
-    // ось1 = высота, ось0 = East (Y_МСК), ось2 = -North (X_МСК) — общая конвенция Y-up.
-    this.toMsk = (a, b) => [a, -b];
-
-    const sliceV = min[vAxis] + 0.01;
-    const footprint = sliceFootprint(meshes, vAxis, hA, hB, sliceV);
-    this.fbx = { meshes, min, max, vAxis, hA, hB, isCloud: tris === 0 };
-
-    await this.ensureMap();
-    this.draw(footprint, [center[hA], center[hB]]);
-    this.setStatus(
-      `${fileName} · ${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "точки"} · точек среза: ${footprint.points.length || footprint.rings.reduce((s, r) => s + r.length, 0)}`,
-    );
-    this.showInfo(min, max, vAxis);
-  }
-
-  /** Загружает IFC: web-ifc → меши (Y-up) → тот же конвейер, что FBX (срез на карту + GIS-01). */
-  async openIfc(file: File): Promise<void> {
-    this.setStatus(`Чтение IFC «${file.name}»…`);
+  async openFiles(files: File[]): Promise<void> {
+    const list = files.filter(Boolean);
+    if (list.length === 0) return;
     this.dropzone.classList.add("hidden");
     try {
-      await this.ensureMap(); // карта до тяжёлого парсинга web-ifc
-      const { IfcParser } = await import("../core/ifc-parser.ts");
-      const parser = new IfcParser();
-      const buf = new Uint8Array(await file.arrayBuffer());
-      await parser.open(buf, { fileName: file.name, fileSize: buf.length });
-      const world = ifcMeshesToWorld(parser.getMeshes());
-      // Захватываем геопривязку IFC ДО закрытия модели (для диагностики GIS-01).
+      await this.ensureMap();
+      await this.ensureProj4();
+    } catch (err) {
+      console.error(err);
+      this.setStatus(this.loadErr(err, "карты"));
+      return;
+    }
+    let ok = 0;
+    const errs: string[] = [];
+    for (const f of list) {
+      this.setStatus(`Обработка «${f.name}» (${ok + errs.length + 1}/${list.length})…`);
       try {
-        const geo = await parser.geoReference();
-        if (geo.ok) {
-          const { lat0, lng0, method } = geo.ref;
-          const inM = lat0 >= 55.09 && lat0 <= 56.08 && lng0 >= 36.75 && lng0 <= 38.0;
-          this.modelGeo = { source: "ifc", ok: true, lat: lat0, lng: lng0, method, inMoscow: inM };
-        } else {
-          this.modelGeo = { source: "ifc", ok: false, reason: geo.reason };
-        }
-      } catch {
-        this.modelGeo = { source: "ifc", ok: false, reason: "ошибка чтения геопривязки" };
+        await this.ingestOne(f);
+        ok++;
+        this.redrawAll(false); // инкрементально, без зума
+        this.renderPanel();
+      } catch (err) {
+        console.error(err);
+        errs.push(`${f.name} — ${this.loadErr(err)}`);
       }
-      parser.close();
-      if (world.verts === 0) {
-        this.setStatus("В IFC не найдено геометрии");
-        return;
-      }
-      await this.placeModel(world, file.name);
-    } catch (err) {
-      console.error(err);
-      this.setStatus(`Ошибка загрузки IFC: ${(err as Error).message}`);
-      this.dropzone.classList.remove("hidden");
     }
+    this.redrawAll(true); // финальный fit по всему набору
+    this.renderPanel();
+    const parts = [
+      this.models.length ? `моделей: ${this.models.length}` : "",
+      this.boundaries.length ? `границ ЗУ: ${this.boundaries.length}` : "",
+      this.redlineSets.length ? `кр. линий: ${this.redlineSets.reduce((s, r) => s + r.n, 0)}` : "",
+    ].filter(Boolean);
+    const head = ok > 0 ? `Загружено · ${parts.join(" · ") || "нет данных"}` : "Ничего не загружено";
+    this.setStatus(errs.length ? `${head}. Ошибки: ${errs.join("; ")}` : head);
   }
 
-  /** Загружает ГПЗУ (PDF), строит участок по координатам поворотных точек (МСК-77). */
-  async openGpzu(file: File): Promise<void> {
-    this.setStatus(`Чтение ГПЗУ «${file.name}»…`);
-    this.dropzone.classList.add("hidden");
-    try {
-      const { parseGpzu } = await import("./gpzu.ts");
-      const parcel = await parseGpzu(file);
-      if (parcel.rings.length === 0) {
-        this.setStatus("В ГПЗУ не найдена таблица координат поворотных точек");
-        return;
-      }
-      this.gpzuRings = parcel.rings;
-      await this.ensureProj4();
-      await this.ensureMap();
-      this.drawGpzu(true);
-      const npts = parcel.rings.reduce((s, r) => s + r.length, 0);
-      const info = [parcel.cadNumber, parcel.area && `${parcel.area} м²`].filter(Boolean).join(" · ");
-      this.setStatus(`ГПЗУ: ${file.name}${info ? " · " + info : ""} · точек: ${npts}`);
-    } catch (err) {
-      console.error(err);
-      this.setStatus("Ошибка чтения ГПЗУ");
-    }
+  // Тонкие обёртки под старые точки входа (drop/инпуты) — всё идёт через openFiles.
+  loadFbx(file: File): Promise<void> { return this.openFiles([file]); }
+  openIfc(file: File): Promise<void> { return this.openFiles([file]); }
+  openGpzu(file: File): Promise<void> { return this.openFiles([file]); }
+  openDwg(file: File): Promise<void> { return this.openFiles([file]); }
+  openRedLines(file: File): Promise<void> { return this.openFiles([file]); }
+
+  /** Понятное сообщение об ошибке; ловит сбой ленивого чанка после редеплоя. */
+  private loadErr(err: unknown, what = ""): string {
+    const m = err instanceof Error ? err.message : String(err);
+    if (/dynamically imported module|module script failed|Failed to fetch|Loading chunk|importing a module|error loading dynamically/i.test(m))
+      return "вышла новая версия — обновите страницу (Cmd/Ctrl+Shift+R)";
+    return what ? `ошибка загрузки ${what}: ${m}` : m;
   }
 
-  /**
-   * Загружает DWG: извлекает кривые по слоям, находит границу ЗУ (по имени слоя
-   * или крупнейший замкнутый контур), кладёт как участок (МСК-77) — как ГПЗУ.
-   * Без ГПЗУ этот контур используется для GIS-01.
-   */
-  async openDwg(file: File): Promise<void> {
-    this.setStatus(`Чтение DWG «${file.name}»…`);
-    this.dropzone.classList.add("hidden");
+  /** Диспетчер по расширению одного файла. */
+  private async ingestOne(file: File): Promise<void> {
+    const name = file.name.toLowerCase();
+    if (name.endsWith(".fbx")) await this.addFbx(file);
+    else if (name.endsWith(".ifc")) await this.addIfc(file);
+    else if (name.endsWith(".dwg")) await this.addDwg(file);
+    else if (name.endsWith(".pdf")) await this.addGpzu(file);
+    else if (name.endsWith(".geojson") || name.endsWith(".json")) await this.addRedLines(file);
+    else throw new Error("неподдерживаемый тип файла");
+  }
+
+  /** FBX → мировые меши (Y-up) → модель в коллекцию. */
+  private async addFbx(file: File): Promise<void> {
+    const buf = await file.arrayBuffer();
+    const group = new FBXLoader().parse(buf, "");
+    group.updateMatrixWorld(true);
+    const world = collectWorld(group);
+    if (world.verts === 0) throw new Error("в FBX не найдено геометрии");
+    this.addModel(world, file.name, "fbx", { source: "fbx" });
+  }
+
+  /** IFC → web-ifc меши (Y-up) + геопривязка → модель в коллекцию. */
+  private async addIfc(file: File): Promise<void> {
+    const { IfcParser } = await import("../core/ifc-parser.ts");
+    const parser = new IfcParser();
+    const buf = new Uint8Array(await file.arrayBuffer());
+    await parser.open(buf, { fileName: file.name, fileSize: buf.length });
+    const world = ifcMeshesToWorld(parser.getMeshes());
+    let geo: ModelGeo;
     try {
-      // Сначала поднимаем карту и proj4 — ДО тяжёлого синхронного парсинга DWG
-      // (libredwg.convert блокирует главный поток и иначе ломает загрузку карты).
-      await this.ensureMap();
-      await this.ensureProj4();
-      const { parseDwg } = await import("./dwg.ts");
-      const res = await parseDwg(file);
-      if (res.rings.length === 0) {
-        this.setStatus(`DWG: контур ЗУ не найден. Слои: ${res.allLayers.slice(0, 8).join(", ") || "—"}`);
-        return;
+      const g = await parser.geoReference();
+      if (g.ok) {
+        const { lat0, lng0, method } = g.ref;
+        const inM = lat0 >= 55.09 && lat0 <= 56.08 && lng0 >= 36.75 && lng0 <= 38.0;
+        geo = { source: "ifc", ok: true, lat: lat0, lng: lng0, method, inMoscow: inM };
+      } else {
+        geo = { source: "ifc", ok: false, reason: g.reason };
       }
-      const toGpzu = this.pickDwgAxis(res.rings);
-      this.gpzuRings = res.rings.map((r) => r.pts.map(toGpzu));
-      this.drawGpzu(true);
-      const npts = this.gpzuRings.reduce((s, r) => s + r.length, 0);
-      // Какие слои ещё похожи на ЗУ (для контроля/выбора, пока имена не унифицированы).
-      const others = res.candidates
-        .filter((c) => c.score > 0 && c.layer !== res.chosenLayer)
-        .slice(0, 4)
-        .map((c) => `${c.layer}(${c.score})`);
-      const layerInfo = res.matchedByLayer
-        ? `слой «${res.chosenLayer}»`
-        : `крупнейший контур (слой ЗУ не распознан — проверьте «${res.chosenLayer}»)`;
-      const hint = others.length ? ` · др. кандидаты: ${others.join(", ")}` : "";
-      this.setStatus(`DWG: ${file.name} · ${layerInfo} · точек: ${npts}${hint}`);
-    } catch (err) {
-      console.error(err);
-      this.setStatus(`Ошибка чтения DWG: ${(err as Error).message}`);
+    } catch {
+      geo = { source: "ifc", ok: false, reason: "ошибка чтения геопривязки" };
     }
+    parser.close();
+    if (world.verts === 0) throw new Error("в IFC не найдено геометрии");
+    this.addModel(world, file.name, "ifc", geo);
   }
 
   /**
-   * Загружает красные линии из GeoJSON (WGS84) и кладёт client-side слоем на карту.
-   * Временно, пока импорт в metatiler не починен; потом заменим на тайлы 347001.
+   * Общая укладка модели (FBX/IFC) в коллекцию: оба источника Y-up (FBXLoader и
+   * web-ifc), поэтому ось/срез/калибровка/GIS-01 — единые. Рисование — в redrawAll.
    */
-  async openRedLines(file: File): Promise<void> {
-    this.setStatus(`Чтение красных линий «${file.name}»…`);
-    this.dropzone.classList.add("hidden");
-    try {
-      await this.ensureMap();
-      const gj = JSON.parse(await file.text());
-      const fc =
-        gj?.type === "FeatureCollection"
-          ? gj
-          : { type: "FeatureCollection", features: gj?.type === "Feature" ? [gj] : [] };
-      const n = Array.isArray(fc.features) ? fc.features.length : 0;
-      if (n === 0) {
-        this.setStatus("В файле красных линий нет объектов (ожидался GeoJSON FeatureCollection)");
-        return;
-      }
-      (this.map!.getSource("redlines-local") as maplibregl.GeoJSONSource).setData(fc);
-      this.redLinesToggle.checked = true;
-      this.setRedLinesVisible(true);
-      // если модель/ЗУ ещё не загружены — подвинем карту к линиям, чтобы их было видно
-      if (!this.fbx && !this.gpzuRings) {
-        const b = new maplibregl.LngLatBounds();
-        let cnt = 0;
-        const extend = (c: unknown): void => {
-          if (Array.isArray(c) && typeof c[0] === "number") {
-            b.extend(c as [number, number]);
-            cnt++;
-          } else if (Array.isArray(c)) {
-            for (const x of c) extend(x);
-          }
-        };
-        for (const f of fc.features) extend((f as { geometry?: { coordinates?: unknown } })?.geometry?.coordinates);
-        if (cnt > 0) this.map!.fitBounds(b, { padding: 60, maxZoom: 16, duration: 0 });
-      }
-      this.setStatus(`Красные линии: ${file.name} · объектов: ${n}`);
-    } catch (err) {
-      console.error(err);
-      this.setStatus(`Ошибка чтения красных линий: ${(err as Error).message}`);
-    }
+  private addModel(
+    world: { meshes: WorldMesh[]; min: number[]; max: number[]; verts: number; tris: number },
+    name: string,
+    kind: "fbx" | "ifc",
+    geo: ModelGeo,
+  ): void {
+    const { meshes, min, max, verts, tris } = world;
+    // ось1=высота, ось0=East, ось2=−North (Y-up). center в горизонт. осях [hA=0, hB=2].
+    const vAxis = 1, hA = 0, hB = 2;
+    const center: Pt = [(min[hA] + max[hA]) / 2, (min[hB] + max[hB]) / 2];
+    const footprint = sliceFootprint(meshes, vAxis, hA, hB, min[vAxis] + 0.01);
+    const geom: FbxGeom = { meshes, min, max, vAxis, hA, hB, isCloud: tris === 0 };
+    const nPts = footprint.points.length || footprint.rings.reduce((s, r) => s + r.length, 0);
+    this.models.push({
+      id: `m${++this.seq}`,
+      name,
+      kind,
+      geom,
+      geo,
+      footprint,
+      center,
+      color: MODEL_PALETTE[this.models.length % MODEL_PALETTE.length],
+      info: `${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "точки"} · срез: ${nPts} тчк`,
+    });
+  }
+
+  /** ГПЗУ (PDF) → участок по координатам поворотных точек (МСК-77) в коллекцию границ. */
+  private async addGpzu(file: File): Promise<void> {
+    const { parseGpzu } = await import("./gpzu.ts");
+    const parcel = await parseGpzu(file);
+    if (parcel.rings.length === 0) throw new Error("в ГПЗУ не найдена таблица координат поворотных точек");
+    const npts = parcel.rings.reduce((s, r) => s + r.length, 0);
+    const meta = [parcel.cadNumber, parcel.area && `${parcel.area} м²`].filter(Boolean).join(" · ");
+    this.boundaries.push({
+      id: `b${++this.seq}`,
+      name: file.name,
+      kind: "gpzu",
+      rings: parcel.rings,
+      ok: true,
+      info: `${meta ? meta + " · " : ""}${npts} тчк`,
+    });
+  }
+
+  /**
+   * DWG → кривые по слоям → граница ЗУ (по имени слоя или крупнейший замкнутый
+   * контур) → участок (МСК-77, авто-детект оси) в коллекцию границ.
+   */
+  private async addDwg(file: File): Promise<void> {
+    const { parseDwg } = await import("./dwg.ts");
+    const res = await parseDwg(file);
+    if (res.rings.length === 0)
+      throw new Error(`контур ЗУ не найден (слои: ${res.allLayers.slice(0, 6).join(", ") || "—"})`);
+    const toGpzu = this.pickDwgAxis(res.rings);
+    const rings = res.rings.map((r) => r.pts.map(toGpzu));
+    const npts = rings.reduce((s, r) => s + r.length, 0);
+    const others = res.candidates
+      .filter((c) => c.score > 0 && c.layer !== res.chosenLayer)
+      .slice(0, 3)
+      .map((c) => `${c.layer}(${c.score})`);
+    const layerInfo = res.matchedByLayer
+      ? `слой «${res.chosenLayer}»`
+      : `крупнейший контур (слой ЗУ не распознан: «${res.chosenLayer}»)`;
+    const hint = others.length ? ` · др.: ${others.join(", ")}` : "";
+    this.boundaries.push({
+      id: `b${++this.seq}`,
+      name: file.name,
+      kind: "dwg",
+      rings,
+      ok: res.matchedByLayer,
+      info: `${layerInfo} · ${npts} тчк${hint}`,
+    });
+  }
+
+  /**
+   * Красные линии из GeoJSON (WGS84) → набор client-side слоя. Временно, пока
+   * импорт в metatiler не починен; потом заменим на тайлы 347001.
+   */
+  private async addRedLines(file: File): Promise<void> {
+    const gj = JSON.parse(await file.text());
+    const fc =
+      gj?.type === "FeatureCollection"
+        ? gj
+        : { type: "FeatureCollection", features: gj?.type === "Feature" ? [gj] : [] };
+    const features: unknown[] = Array.isArray(fc.features) ? fc.features : [];
+    if (features.length === 0) throw new Error("нет объектов (ожидался GeoJSON FeatureCollection)");
+    this.redlineSets.push({ id: `r${++this.seq}`, name: file.name, n: features.length, features });
+    this.rebuildRedlines();
+    this.redLinesToggle.checked = true;
+    this.setRedLinesVisible(true);
+  }
+
+  /** Пересобирает client-side слой красных линий из всех загруженных наборов. */
+  private rebuildRedlines(): void {
+    const src = this.map?.getSource("redlines-local") as maplibregl.GeoJSONSource | undefined;
+    if (!src) return;
+    src.setData({ type: "FeatureCollection", features: this.redlineSets.flatMap((s) => s.features) } as any);
   }
 
   /** Авто-детект оси DWG→МСК-77: пробуем обе ориентации, берём попадание в Москву. */
@@ -309,61 +377,138 @@ export class GisView {
   }
 
   /** Рисует участок ГПЗУ (МСК-77 → WGS84 тем же proj4, что FBX) и делает его целью совмещения. */
-  private drawGpzu(fit: boolean): void {
-    if (!this.map || !this.gpzuRings) return;
-    const map = this.map;
+  /** Пере-рисовывает всё (модели + границы) и при fit масштабирует на весь набор. */
+  private redrawAll(fit: boolean): void {
+    if (!this.map) return;
+    this.recomputePivot();
     const bounds = new maplibregl.LngLatBounds();
-    // Классифицируем кольца на внешние контуры + дырки → GeoJSON Polygon с дырками
-    // (MapLibre вырезает дырки в заливке).
-    const ringsEN: Pt[][] = this.gpzuRings.map((r) => r.map((p) => [p.Y, p.X] as Pt)); // [east,north]
-    const polys = classifyRings(ringsEN);
+    this.drawModels(bounds);
+    this.drawBoundaries(bounds);
+    if (fit && !bounds.isEmpty()) this.map.fitBounds(bounds, { padding: 70, maxZoom: 19, duration: 0 });
+    this.map.resize();
+  }
+
+  /** Общий центр всех моделей в МСК-77 (raw, до калибровки) — ось доворота. */
+  private recomputePivot(): void {
+    if (this.models.length === 0) { this.calibPivot = null; return; }
+    let se = 0, sn = 0;
+    for (const m of this.models) { const [e, n] = this.toMsk(m.center[0], m.center[1]); se += e; sn += n; }
+    this.calibPivot = [se / this.models.length, sn / this.models.length];
+  }
+
+  /** Рисует нижние срезы всех моделей (цветокодировано) + маркеры центров. */
+  private drawModels(bounds: maplibregl.LngLatBounds): void {
+    const map = this.map!;
+    const features: any[] = [];
+    const ext = (c: [number, number]) => {
+      if (Number.isFinite(c[0]) && Number.isFinite(c[1]) && Math.abs(c[1]) <= 90) bounds.extend(c);
+    };
+    for (const m of this.models) {
+      const color = m.color;
+      for (const ring of m.footprint.rings) {
+        const coords = ring.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
+        if (coords.length >= 3) {
+          features.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [coords] }, properties: { k: "ring", color } });
+          coords.forEach(ext);
+        }
+      }
+      for (const line of m.footprint.lines) {
+        const coords = line.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
+        if (coords.length >= 2) {
+          features.push({ type: "Feature", geometry: { type: "LineString", coordinates: coords }, properties: { k: "line", color } });
+          coords.forEach(ext);
+        }
+      }
+      for (const p of m.footprint.points) {
+        const c = this.ll(p);
+        if (Math.abs(c[1]) <= 90) {
+          features.push({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: { k: "pt", color } });
+          ext(c);
+        }
+      }
+    }
+    (map.getSource("footprint") as maplibregl.GeoJSONSource).setData({ type: "FeatureCollection", features } as any);
+
+    this.clearMarkers();
+    for (const m of this.models) {
+      const c = this.ll(m.center);
+      if (Math.abs(c[1]) <= 90) {
+        const mk = new maplibregl.Marker({ color: m.color })
+          .setLngLat(c)
+          .setPopup(new maplibregl.Popup({ offset: 24 }).setText(`${m.name} (срез у основания)`))
+          .addTo(map);
+        this.markers.push(mk);
+        ext(c);
+      }
+    }
+  }
+
+  /** Рисует все границы ЗУ (ГПЗУ+DWG) зелёным; цель «совместить центр» = крупнейший участок. */
+  private drawBoundaries(bounds: maplibregl.LngLatBounds): void {
+    const map = this.map!;
+    const features: any[] = [];
     const toCoords = (ring: Pt[]): [number, number][] => {
       const c = ring.map(([e, n]) => this.toWgs84(e, n)).filter((p) => Math.abs(p[1]) <= 90);
       c.forEach((p) => bounds.extend(p));
       const a = c[0], z = c[c.length - 1];
-      if (a && z && (a[0] !== z[0] || a[1] !== z[1])) c.push(a); // замкнуть
+      if (a && z && (a[0] !== z[0] || a[1] !== z[1])) c.push(a);
       return c;
     };
-    const features = polys
-      .filter((poly) => poly.exterior.length >= 3)
-      .map((poly) => ({
-        type: "Feature",
-        geometry: {
-          type: "Polygon",
-          coordinates: [toCoords(poly.exterior), ...poly.holes.filter((h) => h.length >= 3).map(toCoords)],
-        },
-        properties: {},
-      }));
-    (map.getSource("gpzu") as maplibregl.GeoJSONSource).setData({
-      type: "FeatureCollection",
-      features,
-    } as any);
+    let best: { area: number; c: Pt } | null = null;
+    for (const b of this.boundaries) {
+      const ringsEN: Pt[][] = b.rings.map((r) => r.map((p) => [p.Y, p.X] as Pt)); // [east,north]
+      for (const poly of classifyRings(ringsEN)) {
+        if (poly.exterior.length < 3) continue;
+        features.push({
+          type: "Feature",
+          geometry: { type: "Polygon", coordinates: [toCoords(poly.exterior), ...poly.holes.filter((h) => h.length >= 3).map(toCoords)] },
+          properties: { id: b.id },
+        });
+        const area = ringAreaEN(poly.exterior);
+        const c = centroidEN(poly.exterior);
+        if (c && (!best || area > best.area)) best = { area, c };
+      }
+    }
+    (map.getSource("gpzu") as maplibregl.GeoJSONSource).setData({ type: "FeatureCollection", features } as any);
 
-    // Центр участка в МСК-77 → цель для «совместить центр» (north=X, east=Y).
-    let sX = 0, sY = 0, n = 0;
-    for (const r of this.gpzuRings) for (const p of r) { sX += p.X; sY += p.Y; n++; }
-    if (n > 0) {
-      this.targetMsk = [sY / n, sX / n]; // [east, north]
+    if (best) {
+      this.targetMsk = best.c; // [east, north]
       const snapBtn = this.infoEl.querySelector<HTMLButtonElement>("#gis-snap");
       if (snapBtn) snapBtn.hidden = false;
       const tInfo = this.infoEl.querySelector("#gis-target-info");
-      if (tInfo) tInfo.textContent = `Цель: участок ГПЗУ, центр МСК-77 E ${(sY / n).toFixed(1)} N ${(sX / n).toFixed(1)}`;
+      if (tInfo) tInfo.textContent = `Цель: участок ЗУ, центр МСК-77 E ${best.c[0].toFixed(1)} N ${best.c[1].toFixed(1)}`;
     }
+  }
 
-    if (fit && !bounds.isEmpty()) map.fitBounds(bounds, { padding: 80, maxZoom: 19, duration: 0 });
-    map.resize();
+  private clearMarkers(): void {
+    for (const m of this.markers) m.remove();
+    this.markers = [];
+  }
+
+  /** Удаляет загруженный элемент (модель/границу/кр.линии) по id и пере-рисовывает. */
+  removeItem(id: string): void {
+    this.models = this.models.filter((m) => m.id !== id);
+    this.boundaries = this.boundaries.filter((b) => b.id !== id);
+    const before = this.redlineSets.length;
+    this.redlineSets = this.redlineSets.filter((r) => r.id !== id);
+    if (this.redlineSets.length !== before) this.rebuildRedlines();
+    // перенумеруем цвета моделей по палитре после удаления
+    this.models.forEach((m, i) => (m.color = MODEL_PALETTE[i % MODEL_PALETTE.length]));
+    this.redrawAll(false);
+    this.renderPanel();
+    this.setStatus("Элемент удалён");
   }
 
   private toWgs84(east: number, north: number): [number, number] {
     const [lng, lat] = this.proj4(MSK77, "WGS84", [east, north]);
     return [lng, lat]; // GeoJSON-порядок [lng, lat]
   }
-  /** Горизонтальные координаты среза FBX → МСК-77 [east,north] с учётом калибровки. */
+  /** Горизонтальные координаты среза модели → МСК-77 [east,north] с учётом калибровки. */
   private toMskCal(p: Pt): Pt {
     let [e, n] = this.toMsk(p[0], p[1]);
-    // Доворот вокруг центра модели (в кадре МСК-77), затем сдвиг.
-    if (this.calibRot !== 0 && this.lastCenter) {
-      const [e0, n0] = this.toMsk(this.lastCenter[0], this.lastCenter[1]);
+    // Доворот вокруг общего центра моделей (в кадре МСК-77), затем сдвиг.
+    if (this.calibRot !== 0 && this.calibPivot) {
+      const [e0, n0] = this.calibPivot;
       const th = (this.calibRot * Math.PI) / 180;
       const cos = Math.cos(th), sin = Math.sin(th);
       const de = e - e0, dn = n - n0;
@@ -378,35 +523,39 @@ export class GisView {
   }
 
   /**
-   * Проверка GIS-01 «Здание полностью в границах ЗУ».
-   * Нужны загруженные ГПЗУ (участок) и FBX (здание). Возвращает результат +
-   * SVG-эскиз (вид сверху). Сами вычисления — в gis01.ts.
+   * Проверка GIS-01 «Здание полностью в границах ЗУ» — по КАЖДОЙ модели.
+   * Нужны хотя бы одна граница ЗУ (ГПЗУ/DWG) и хотя бы одна модель (FBX/IFC).
+   * Каждая модель проверяется против ОБЪЕДИНЕНИЯ всех границ; возвращается список
+   * вердиктов (по модели) + SVG-эскиз каждой. Сами вычисления — в gis01.ts.
    */
-  async runGis01(): Promise<{ status: string; summary: string; svg: string } | null> {
-    if (!this.fbx) {
+  runAllChecks(): { perModel: ModelCheckResult[]; counts: { pass: number; warn: number; fail: number } } | null {
+    if (this.models.length === 0) {
       this.setStatus("GIS-01: сначала загрузите модель (FBX/IFC)");
       return null;
     }
-    if (!this.gpzuRings || this.gpzuRings.length === 0) {
+    if (this.boundaries.length === 0) {
       this.setStatus("GIS-01: сначала загрузите ГПЗУ или DWG (границу ЗУ)");
       return null;
     }
-    const ringsEN: Pt[][] = this.gpzuRings.map((r) => r.map((p) => [p.Y, p.X] as Pt)); // [east,north]
-    const parcelPolys = classifyRings(ringsEN); // внешние контуры + дырки
-    const res = runGis01Calc(this.fbx, parcelPolys, (p) => this.toMskCal(p));
-
-    // Если объект ни одной точкой не попал в ЗУ — диагностируем геопривязку
-    // (детально — в эскиз/отчёт; в заголовке оставляем краткий вердикт).
-    const diagnostic = res.noOverlap ? this.geoDiagnostic() : "";
-    const svg = sketchSvg(res, { diagnostic });
-    this.setStatus(`GIS-01: ${res.summary}`);
-    return { status: res.status, summary: res.summary, svg };
+    // Объединение всех границ ЗУ (внешние контуры + дырки из всех источников).
+    const parcelPolys = this.boundaries.flatMap((b) =>
+      classifyRings(b.rings.map((r) => r.map((p) => [p.Y, p.X] as Pt))),
+    );
+    const perModel: ModelCheckResult[] = this.models.map((m) => {
+      const res = runGis01Calc(m.geom, parcelPolys, (p) => this.toMskCal(p));
+      const diagnostic = res.noOverlap ? this.geoDiagnostic(m.geo) : "";
+      const svg = sketchSvg(res, { diagnostic, file: `${m.name} (${m.kind.toUpperCase()})` });
+      return { modelId: m.id, name: m.name, color: m.color, status: res.status, summary: res.summary, diagnostic, svg };
+    });
+    const counts = { pass: 0, warn: 0, fail: 0 };
+    for (const r of perModel) counts[r.status]++;
+    this.setStatus(`GIS-01 · моделей: ${perModel.length} — ✓${counts.pass} ⚠${counts.warn} ✗${counts.fail}`);
+    this.renderPanel(perModel);
+    return { perModel, counts };
   }
 
-  /** Диагностика геопривязки модели для случая «объект вне ЗУ». */
-  private geoDiagnostic(): string {
-    const g = this.modelGeo;
-    if (!g) return "Источник модели неизвестен — проверьте координаты модели и ЗУ.";
+  /** Диагностика геопривязки конкретной модели для случая «объект вне ЗУ». */
+  private geoDiagnostic(g: ModelGeo): string {
     if (g.source === "fbx") {
       return "FBX не несёт геопривязку в МСК-77 (голая геометрия от начала координат). Если объект вне ЗУ — модель смоделирована НЕ в МСК-77 либо смещена: совместите центр и докалибруйте, либо проверьте экспорт координат.";
     }
@@ -419,59 +568,6 @@ export class GisView {
       return `Проблема IFC: геопривязка (${g.method}) ведёт ВНЕ Москвы — якорь ${coord}. Координаты заданы в чужой СК (не МСК-77) — типично для Revit-дефолта. Нужна корректная привязка МСК-77 (IfcMapConversion/IfcProjectedCRS или IfcSite lat/lng).`;
     }
     return `Проблема IFC: геопривязка отсутствует/не вычислена (${g.reason}). Модель нельзя позиционировать по IFC-гео — задайте МСК-77 (IfcMapConversion + IfcProjectedCRS=МСК-77, либо IfcSite RefLatitude/RefLongitude).`;
-  }
-
-  private draw(fp: Footprint, centerMsk: Pt, fit = true): void {
-    this.lastFp = fp;
-    this.lastCenter = centerMsk;
-    const map = this.map!;
-    const features: any[] = [];
-    const bounds = new maplibregl.LngLatBounds();
-    const ext = (c: [number, number]) => {
-      if (Number.isFinite(c[0]) && Number.isFinite(c[1]) && Math.abs(c[1]) <= 90) bounds.extend(c);
-    };
-
-    for (const ring of fp.rings) {
-      const coords = ring.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
-      if (coords.length >= 3) {
-        features.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [coords] }, properties: { k: "ring" } });
-        coords.forEach(ext);
-      }
-    }
-    for (const line of fp.lines) {
-      const coords = line.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
-      if (coords.length >= 2) {
-        features.push({ type: "Feature", geometry: { type: "LineString", coordinates: coords }, properties: { k: "line" } });
-        coords.forEach(ext);
-      }
-    }
-    if (fp.points.length) {
-      const coords = fp.points.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
-      coords.forEach((c) => {
-        features.push({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: { k: "pt" } });
-        ext(c);
-      });
-    }
-
-    (map.getSource("footprint") as maplibregl.GeoJSONSource).setData({
-      type: "FeatureCollection",
-      features,
-    } as any);
-
-    const c = this.ll(centerMsk);
-    this.centerMarker?.remove();
-    if (Math.abs(c[1]) <= 90) {
-      this.centerMarker = new maplibregl.Marker({ color: FOOTPRINT_COLOR })
-        .setLngLat(c)
-        .setPopup(new maplibregl.Popup({ offset: 24 }).setText("Модель (срез у основания)"))
-        .addTo(map);
-      ext(c);
-    }
-
-    if (fit && !bounds.isEmpty()) {
-      map.fitBounds(bounds, { padding: 60, maxZoom: 19, duration: 0 });
-    }
-    map.resize();
   }
 
   /** Меняет калибровку (ΔВосток, ΔСевер в м; Δθ в град), сохраняет, пере-рисует без зума. */
@@ -488,7 +584,7 @@ export class GisView {
       /* localStorage недоступен — калибровка только на сессию */
     }
     this.updateCalibReadout();
-    if (this.lastFp && this.lastCenter) this.draw(this.lastFp, this.lastCenter, false);
+    this.redrawAll(false);
   }
 
   private updateCalibReadout(): void {
@@ -497,26 +593,83 @@ export class GisView {
       el.textContent = `ΔВ ${this.calibE.toFixed(1)} · ΔС ${this.calibN.toFixed(1)} м · ∠ ${this.calibRot.toFixed(1)}°`;
   }
 
-  private showInfo(min: number[], max: number[], vAxis: number): void {
+  /** Левая панель: загруженные данные (с удалением) + проверки + калибровка. */
+  renderPanel(checks?: ModelCheckResult[]): void {
+    if (checks) this.lastChecks = checks;
     this.infoEl.hidden = false;
-    const f = (n: number) => n.toFixed(1);
+    const hasModels = this.models.length > 0;
+    const canCheck = hasModels && this.boundaries.length > 0;
+
+    const items: string[] = [];
+    for (const m of this.models)
+      items.push(this.itemRow(m.id, m.kind.toUpperCase(), m.name, m.info, "gis-badge-model", m.color));
+    for (const b of this.boundaries)
+      items.push(this.itemRow(b.id, b.kind === "dwg" ? "DWG" : "ГПЗУ", b.name, b.info, b.ok ? "gis-badge-zu" : "gis-badge-warn"));
+    for (const r of this.redlineSets)
+      items.push(this.itemRow(r.id, "кр.линии", r.name, `${r.n} об.`, "gis-badge-rl"));
+    const itemsHtml = items.length
+      ? items.join("")
+      : `<div class="gis-empty">Перетащите файлы (IFC / DWG / FBX / PDF / GeoJSON) или «Открыть файлы»</div>`;
+
+    const checkRows = (this.lastChecks || [])
+      .map(
+        (c) => `<div class="gis-check-item">
+          <span class="gis-swatch" style="background:${c.color}"></span>
+          <span class="gis-check-name" title="${esc(c.summary)}">${esc(c.name)}</span>
+          <span class="gis-check-badge status-${c.status}">${c.status === "pass" ? "✓" : c.status === "warn" ? "⚠" : "✗"}</span>
+        </div>`,
+      )
+      .join("");
+    const checksBody = canCheck
+      ? `<button id="gis-run-checks" class="gis-run-checks">▶ GIS-01 · здание в границах ЗУ</button>${checkRows ? `<div class="gis-check-list">${checkRows}</div>` : ""}`
+      : `<div class="gis-empty">Загрузите модель (FBX/IFC) и границу ЗУ (ГПЗУ/DWG)</div>`;
+
     this.infoEl.innerHTML = `
-      <div class="gis-info-row"><b>МСК-77 bbox</b></div>
-      <div class="gis-info-row">X: ${f(min[0])} … ${f(max[0])}</div>
-      <div class="gis-info-row">Y: ${f(min[1])} … ${f(max[1])}</div>
-      <div class="gis-info-row">Z: ${f(min[2])} … ${f(max[2])}</div>
-      <div class="gis-info-row">вертикаль: ось ${vAxis} · срез +0.01 от низа</div>
+      <div class="gis-panel-sec">
+        <div class="gis-panel-head"><b>Загруженные данные</b></div>
+        <div class="gis-items">${itemsHtml}</div>
+      </div>
+      <div class="gis-panel-sec">
+        <div class="gis-panel-head"><b>Проверки</b></div>
+        ${checksBody}
+      </div>
+      ${hasModels ? this.calibPanelHtml() : ""}`;
+
+    this.infoEl.querySelectorAll<HTMLButtonElement>("[data-del]").forEach((btn) =>
+      btn.addEventListener("click", () => this.removeItem(btn.dataset.del!)),
+    );
+    this.infoEl.querySelector<HTMLButtonElement>("#gis-run-checks")?.addEventListener("click", () => this.onShowChecks?.());
+    if (hasModels) {
+      this.wireCalibControls();
+      this.wireTargetControls();
+      this.updateCalibReadout();
+    }
+  }
+
+  private itemRow(id: string, badge: string, name: string, info: string, badgeCls: string, swatch?: string): string {
+    return `<div class="gis-item">
+      <span class="gis-badge ${badgeCls}">${esc(badge)}</span>
+      ${swatch ? `<span class="gis-swatch" style="background:${swatch}"></span>` : ""}
+      <span class="gis-item-name" title="${esc(name)}">${esc(name)}</span>
+      <span class="gis-item-info">${esc(info)}</span>
+      <button class="gis-item-del" data-del="${id}" title="убрать">✕</button>
+    </div>`;
+  }
+
+  /** Markup блока «Мой участок» + калибровка (общая на все модели). */
+  private calibPanelHtml(): string {
+    return `
       <div class="gis-target">
-        <div class="gis-info-row"><b>Мой участок</b> (кад. №)</div>
+        <div class="gis-panel-head"><b>Мой участок</b> (кад. №)</div>
         <div class="gis-target-row">
           <input id="gis-cadnum" type="text" placeholder="77:06:0005005:..." spellcheck="false" />
           <button id="gis-cadfind" title="найти участок в видимой области">Найти</button>
         </div>
         <div id="gis-target-info" class="gis-info-row gis-target-info"></div>
-        <button id="gis-snap" class="gis-snap" hidden>Совместить центр модели ↹ участок</button>
+        <button id="gis-snap" class="gis-snap" hidden>Совместить центр моделей ↹ участок</button>
       </div>
       <div class="gis-calib">
-        <div class="gis-info-row"><b>Калибровка к кадастру</b> <span id="gis-calib-val"></span></div>
+        <div class="gis-panel-head"><b>Калибровка к кадастру</b> <span id="gis-calib-val"></span></div>
         <div class="gis-calib-pad">
           <button data-calib="n+" title="север +">▲</button>
           <div class="gis-calib-mid">
@@ -545,9 +698,6 @@ export class GisView {
           <button data-calib="rot+" title="по часовой">↻</button>
         </div>
       </div>`;
-    this.wireCalibControls();
-    this.wireTargetControls();
-    this.updateCalibReadout();
   }
 
   /** Ввод кад. номера → найти участок и кнопка «совместить центр». */
@@ -609,11 +759,12 @@ export class GisView {
       infoEl.textContent = `участок найден · центр МСК-77 E ${e.toFixed(1)} N ${n.toFixed(1)} (${feats.length} фрагм.)`;
   }
 
-  /** Сдвигает калибровку так, чтобы центр модели совпал с центром целевого участка. */
+  /** Сдвигает калибровку так, чтобы общий центр моделей совпал с центром целевого участка. */
   private snapToTarget(): void {
-    if (!this.targetMsk || !this.lastCenter) return;
-    const [be, bn] = this.toMsk(this.lastCenter[0], this.lastCenter[1]);
-    this.applyCalib(this.targetMsk[0] - be, this.targetMsk[1] - bn, this.calibRot);
+    this.recomputePivot();
+    if (!this.targetMsk || !this.calibPivot) return;
+    // calibPivot — центр моделей в raw МСК (до калибровки); сдвиг = target − pivot.
+    this.applyCalib(this.targetMsk[0] - this.calibPivot[0], this.targetMsk[1] - this.calibPivot[1], this.calibRot);
   }
 
   /** Навешивает обработчики на пад калибровки в инфо-панели. */
@@ -783,27 +934,29 @@ export class GisView {
       source: "gpzu",
       paint: { "line-color": GPZU_COLOR, "line-width": 2.5 },
     });
+    // Срезы моделей — цвет берётся из свойства feature (цветокодировка моделей).
+    const fpColor = ["coalesce", ["get", "color"], FOOTPRINT_COLOR] as any;
     map.addSource("footprint", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
     map.addLayer({
       id: "fp-fill",
       type: "fill",
       source: "footprint",
       filter: ["==", ["get", "k"], "ring"],
-      paint: { "fill-color": FOOTPRINT_COLOR, "fill-opacity": 0.25 },
+      paint: { "fill-color": fpColor, "fill-opacity": 0.25 },
     });
     map.addLayer({
       id: "fp-line",
       type: "line",
       source: "footprint",
       filter: ["in", ["get", "k"], ["literal", ["ring", "line"]]],
-      paint: { "line-color": FOOTPRINT_COLOR, "line-width": 2 },
+      paint: { "line-color": fpColor, "line-width": 2 },
     });
     map.addLayer({
       id: "fp-pt",
       type: "circle",
       source: "footprint",
       filter: ["==", ["get", "k"], "pt"],
-      paint: { "circle-radius": 2.5, "circle-color": FOOTPRINT_COLOR, "circle-opacity": 0.8 },
+      paint: { "circle-radius": 2.5, "circle-color": fpColor, "circle-opacity": 0.8 },
     });
   }
 
@@ -829,6 +982,29 @@ export class GisView {
     map.on("mouseenter", "cad-fill", () => (map.getCanvas().style.cursor = "pointer"));
     map.on("mouseleave", "cad-fill", () => (map.getCanvas().style.cursor = ""));
   }
+}
+
+// ── Утилиты ──────────────────────────────────────────────────────────────────
+
+/** Экранирование для вставки в HTML/атрибуты панели. */
+function esc(s: string): string {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+/** Площадь кольца [east,north] (шнуровка). */
+function ringAreaEN(ring: Pt[]): number {
+  let a = 0;
+  for (let i = 0, n = ring.length; i < n; i++) {
+    const j = (i + 1) % n;
+    a += ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1];
+  }
+  return Math.abs(a) / 2;
+}
+/** Центроид кольца [east,north]. */
+function centroidEN(ring: Pt[]): Pt | null {
+  if (ring.length === 0) return null;
+  let sx = 0, sy = 0;
+  for (const p of ring) { sx += p[0]; sy += p[1]; }
+  return [sx / ring.length, sy / ring.length];
 }
 
 // ── Геометрия FBX ────────────────────────────────────────────────────────────

@@ -36,8 +36,9 @@ export interface Gis01Result {
   levels: Gis01Level[];
   baseLevel: Gis01Level | null;
   exitLevel: Gis01Level | null; // первая высота с выходом за границы
-  parcelEN: Pt[]; // внешний контур ЗУ [east, north]
-  parcelHoles: Pt[][]; // дырки (исключённые внутренние области) ЗУ
+  parcelEN: Pt[]; // внешний контур ЗУ [east, north] (наибольший — для центроида/смещения)
+  parcelHoles: Pt[][]; // дырки (исключённые внутренние области) наибольшего ЗУ
+  parcelPolys: PolyWithHoles[]; // ВСЕ границы ЗУ (объединение всех источников) — для эскиза/проверки
   noOverlap: boolean; // объект НИ ОДНОЙ точкой не попал в ЗУ (проблема координат)
   offsetM: number; // расстояние центр объекта ↔ центр ЗУ, м
   buildingCentroidEN: Pt | null;
@@ -145,14 +146,18 @@ export function pointInPolygon(pt: Pt, exterior: Pt[], holes: Pt[][]): boolean {
 
 /**
  * Прогон GIS-01.
- * @param parcelPolys полигоны ЗУ в [east,north] (МСК-77) с дырками; ЗУ = полигон
- *   макс. площади внешнего контура. Точка «в ЗУ» = внутри внешнего И не в дырке.
+ * @param parcelPolys полигоны ЗУ в [east,north] (МСК-77) с дырками; могут быть из
+ *   нескольких источников (ГПЗУ + DWG, несколько участков). Точка «в ЗУ» = внутри
+ *   внешнего контура ХОТЯ БЫ ОДНОГО полигона И не в его дырке. Для центроида/смещения
+ *   берётся участок макс. площади.
  * @param toMskCal перевод горизонтальных координат среза FBX в МСК-77 [east,north] с калибровкой.
  */
 export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: (p: Pt) => Pt): Gis01Result {
+  const polys = parcelPolys.filter((p) => p.exterior.length >= 3);
   const parcel =
-    parcelPolys.slice().sort((a, b) => ringArea(b.exterior) - ringArea(a.exterior))[0] ?? { exterior: [], holes: [] };
+    polys.slice().sort((a, b) => ringArea(b.exterior) - ringArea(a.exterior))[0] ?? { exterior: [], holes: [] };
   const parcelEN = parcel.exterior;
+  const insideAny = (en: Pt): boolean => polys.some((pl) => pointInPolygon(en, pl.exterior, pl.holes));
   const base = geom.min[geom.vAxis];
   const top = geom.max[geom.vAxis];
   const levels: Gis01Level[] = [];
@@ -163,7 +168,7 @@ export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: 
     const outsideEN: Pt[] = [];
     for (const p of raw) {
       const en = toMskCal(p);
-      if (pointInPolygon(en, parcel.exterior, parcel.holes)) insideEN.push(en);
+      if (insideAny(en)) insideEN.push(en);
       else outsideEN.push(en);
     }
     levels.push({
@@ -211,7 +216,7 @@ export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: 
     status = "warn";
     summary = `Нижняя часть в пределах ЗУ; с высоты ${exitLevel.hRel} м часть выступает за границы ЗУ (${exitLevel.outside} точек).`;
   }
-  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN, parcelHoles: parcel.holes, noOverlap, offsetM, buildingCentroidEN };
+  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN, parcelHoles: parcel.holes, parcelPolys: polys, noOverlap, offsetM, buildingCentroidEN };
 }
 
 function centroidOf(ring: Pt[]): Pt | null {
@@ -247,7 +252,9 @@ function escXml(s: string): string {
 /** SVG-эскиз вид сверху: ЗУ + срез основания + срез на высоте выхода (выступающие — красным). */
 export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string; diagnostic?: string }): string {
   const W = 760, H = 620, pad = 36;
-  const all: Pt[] = [...res.parcelEN];
+  const polys = res.parcelPolys?.length ? res.parcelPolys : [{ exterior: res.parcelEN, holes: res.parcelHoles || [] }];
+  const all: Pt[] = [];
+  for (const pl of polys) { all.push(...pl.exterior); for (const h of pl.holes) all.push(...h); }
   if (res.baseLevel) all.push(...res.baseLevel.insideEN, ...res.baseLevel.outsideEN);
   if (res.exitLevel) all.push(...res.exitLevel.insideEN, ...res.exitLevel.outsideEN);
   if (res.buildingCentroidEN) all.push(res.buildingCentroidEN);
@@ -267,8 +274,12 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
 
   const ringToPath = (ring: Pt[]) =>
     ring.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ") + " Z";
-  // Внешний контур + дырки одним path с fill-rule=evenodd → дырки вырезаются.
-  const ringPath = [res.parcelEN, ...(res.parcelHoles || [])].map(ringToPath).join(" ");
+  // Каждый участок (внешний контур + его дырки) — отдельным path с fill-rule=evenodd
+  // (дырки вырезаются), поддерживает несколько участков из разных источников.
+  const parcelPaths = polys
+    .map((pl) => [pl.exterior, ...pl.holes].map(ringToPath).join(" "))
+    .map((d) => `<path d="${d}" fill="#16a34a" fill-opacity="0.08" fill-rule="evenodd" stroke="#16a34a" stroke-width="2"/>`)
+    .join("");
   const dots = (pts: Pt[], color: string, r: number) =>
     pts.map((p) => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="${r}" fill="${color}"/>`).join("");
 
@@ -299,8 +310,9 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
   <rect width="${W}" height="${H}" fill="#ffffff"/>
   <text x="${pad}" y="22" font-size="15" font-weight="bold" fill="#222">GIS-01 · Здание в границах ЗУ — вид сверху</text>
   <text x="${pad}" y="38" font-size="11" fill="${statusColor}" font-weight="bold">${statusText}</text>
-  ${opts?.cad ? `<text x="${W - pad}" y="22" font-size="11" fill="#555" text-anchor="end">ЗУ ${opts.cad}</text>` : ""}
-  <path d="${ringPath}" fill="#16a34a" fill-opacity="0.08" fill-rule="evenodd" stroke="#16a34a" stroke-width="2"/>
+  ${opts?.file ? `<text x="${W - pad}" y="22" font-size="11" fill="#555" text-anchor="end">${escXml(opts.file)}</text>` : ""}
+  ${opts?.cad ? `<text x="${W - pad}" y="36" font-size="11" fill="#555" text-anchor="end">ЗУ ${escXml(opts.cad)}</text>` : ""}
+  ${parcelPaths}
   ${res.baseLevel ? dots(res.baseLevel.insideEN, "#1f9d55", 1.7) : ""}
   ${res.exitLevel ? dots(res.exitLevel.insideEN, "#9aa0a6", 1.4) : ""}
   ${res.exitLevel ? dots(res.exitLevel.outsideEN, "#e2241a", 2.4) : ""}
