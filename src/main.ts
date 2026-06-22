@@ -354,7 +354,6 @@ async function initGis(): Promise<GisView> {
     $("#gis-info"),
     $("#gis-dropzone"),
     $<HTMLInputElement>("#gis-cadastre"),
-    $<HTMLInputElement>("#gis-redlines"),
   );
   // Единый загрузчик: один input на все типы (multiple) + drop любого микса файлов.
   const filesInput = $<HTMLInputElement>("#gis-files");
@@ -362,6 +361,14 @@ async function initGis(): Promise<GisView> {
     const files = Array.from((e.target as HTMLInputElement).files || []);
     if (files.length) void view.openFiles(files);
     filesInput.value = ""; // позволяем выбрать те же файлы повторно
+  });
+  // Тематические ГИС-слои: тип из select + файл(ы) GeoJSON.
+  const layerInput = $<HTMLInputElement>("#gis-layer-file");
+  const layerKind = $<HTMLSelectElement>("#gis-layer-kind");
+  layerInput.addEventListener("change", (e) => {
+    const files = Array.from((e.target as HTMLInputElement).files || []);
+    if (files.length) void view.loadGisLayer(files, layerKind.value as Parameters<typeof view.loadGisLayer>[1]);
+    layerInput.value = "";
   });
   const gbody = $<HTMLElement>(".gis-body");
   const gdrop = $<HTMLElement>("#gis-dropzone");

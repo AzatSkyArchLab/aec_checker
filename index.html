@@ -112,11 +112,19 @@
             <input id="gis-cadastre" type="checkbox" checked />
             Кадастр
           </label>
-          <label class="gis-cad-toggle">
-            <input id="gis-redlines" type="checkbox" checked />
-            Красные линии
-          </label>
           <button id="gis01-run" class="btn" title="GIS-01: здание в границах ЗУ (нужны модель + граница ЗУ)">Проверка GIS-01</button>
+          <div class="gis-layer-loader">
+            <select id="gis-layer-kind" title="тип ГИС-слоя (GeoJSON)">
+              <option value="redlines">Красные линии</option>
+              <option value="cadastral">Кадастровые (линии)</option>
+              <option value="okn-territory">Территории ОКН</option>
+              <option value="okn-object">Объекты ОКН</option>
+            </select>
+            <label class="btn" title="подгрузить GeoJSON выбранного типа">
+              + ГИС-слой
+              <input id="gis-layer-file" type="file" accept=".geojson,.json" multiple hidden />
+            </label>
+          </div>
           <label class="btn btn-primary">
             Открыть файлы
             <input id="gis-files" type="file" accept=".fbx,.ifc,.dwg,.pdf,.geojson,.json" multiple hidden />

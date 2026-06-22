@@ -24,9 +24,6 @@ const PULKOVO_GEO = "+proj=longlat +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0
 const METATILER_BASE = "https://meta-tiler-stage.metapolis.su";
 const CADASTRE_LAYER_ID = 101;
 const CADASTRE_SRC_LAYER = "main"; // имя source-layer в MVT этого сервера
-const REDLINES_LAYER_ID = 347001; // красные линии (импорт в metatiler)
-const REDLINES_SRC_LAYER = "main";
-const REDLINES_COLOR = "#dc2626";
 const OSM_TILES = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png";
 
 const FOOTPRINT_COLOR = "#e8590c";
@@ -36,6 +33,17 @@ const GPZU_COLOR = "#16a34a"; // зелёный — авторитетный у�
 // Палитра для нескольких моделей одновременно (цветокодировка контуров на карте).
 const MODEL_PALETTE = ["#e8590c", "#7048e8", "#0ca678", "#e64980", "#1098ad", "#f08c00", "#4263eb", "#ae3ec9"];
 type Pt = [number, number];
+
+/** Тематические client-side ГИС-слои (GeoJSON): свой цвет/источник/слои на каждый тип. */
+type GisLayerKind = "redlines" | "cadastral" | "okn-territory" | "okn-object";
+interface GisLayerType { label: string; color: string; src: string; fill: string; line: string }
+const GIS_LAYER_TYPES: Record<GisLayerKind, GisLayerType> = {
+  redlines:        { label: "Красные линии",  color: "#dc2626", src: "ov-redlines",  fill: "ov-redlines-fill",  line: "ov-redlines-line" },
+  cadastral:       { label: "Кадастровые",    color: "#0891b2", src: "ov-cadastral", fill: "ov-cadastral-fill", line: "ov-cadastral-line" },
+  "okn-territory": { label: "Территории ОКН", color: "#7c3aed", src: "ov-oknt",      fill: "ov-oknt-fill",      line: "ov-oknt-line" },
+  "okn-object":    { label: "Объекты ОКН",    color: "#c026d3", src: "ov-okno",      fill: "ov-okno-fill",      line: "ov-okno-line" },
+};
+const GIS_LAYER_KINDS = Object.keys(GIS_LAYER_TYPES) as GisLayerKind[];
 
 /** Геопривязка модели (для диагностики «объект вне ЗУ» в GIS-01). */
 type ModelGeo =
@@ -65,12 +73,14 @@ interface Boundary {
   ok: boolean; // распознано/геопривязка вменяемая
 }
 
-/** Набор красных линий из GeoJSON (WGS84), временно client-side. */
-interface RedLineSet {
+/** Загруженный тематический ГИС-слой из GeoJSON (client-side). */
+interface GisLayer {
   id: string;
   name: string;
+  kind: GisLayerKind;
   n: number;
   features: unknown[];
+  visible: boolean;
 }
 
 /** Результат GIS-01 по одной модели — для модалки и панели. */
@@ -110,14 +120,14 @@ export class GisView {
   private targetMsk: Pt | null = null;
   /** Цель задана пользователем (поиск по кад.№) — не перетирать центром границы. */
   private targetIsUserPicked = false;
-  /** Датум красных линий: как в файле (WGS84) или Пулково-1942/МСК-77 (+датум-сдвиг). */
-  private redlinesDatum: "wgs84" | "pulkovo" = "wgs84";
+  /** Датум городских ГИС-слоёв: как в файле (WGS84) или Пулково-1942/МСК-77 (+сдвиг). */
+  private overlaysDatum: "wgs84" | "pulkovo" = "wgs84";
   /** Загруженные модели зданий (FBX/IFC) — все рисуются и проверяются одновременно. */
   private models: PlacedModel[] = [];
   /** Загруженные границы ЗУ (ГПЗУ/DWG) — объединение участвует в GIS-01. */
   private boundaries: Boundary[] = [];
-  /** Загруженные наборы красных линий (GeoJSON, client-side). */
-  private redlineSets: RedLineSet[] = [];
+  /** Тематические ГИС-слои (красные линии / кадастровые / ОКН) из GeoJSON. */
+  private gisLayers: GisLayer[] = [];
   private seq = 0;
   /** Последний прогон GIS-01 (для перерисовки панели). */
   private lastChecks: ModelCheckResult[] | null = null;
@@ -130,13 +140,9 @@ export class GisView {
     private infoEl: HTMLElement,
     private dropzone: HTMLElement,
     private cadastreToggle: HTMLInputElement,
-    private redLinesToggle: HTMLInputElement,
   ) {
     this.cadastreToggle.addEventListener("change", () => {
       this.setCadastreVisible(this.cadastreToggle.checked);
-    });
-    this.redLinesToggle.addEventListener("change", () => {
-      this.setRedLinesVisible(this.redLinesToggle.checked);
     });
     try {
       const saved = JSON.parse(localStorage.getItem("gis-calib") || "null");
@@ -201,9 +207,44 @@ export class GisView {
     const parts = [
       this.models.length ? `моделей: ${this.models.length}` : "",
       this.boundaries.length ? `границ ЗУ: ${this.boundaries.length}` : "",
-      this.redlineSets.length ? `кр. линий: ${this.redlineSets.reduce((s, r) => s + r.n, 0)}` : "",
+      this.gisLayers.length ? `ГИС-слоёв: ${this.gisLayers.length}` : "",
     ].filter(Boolean);
     const head = ok > 0 ? `Загружено · ${parts.join(" · ") || "нет данных"}` : "Ничего не загружено";
+    this.setStatus(errs.length ? `${head}. Ошибки: ${errs.join("; ")}` : head);
+  }
+
+  /**
+   * Загрузка тематических ГИС-слоёв (GeoJSON) выбранного типа: кадастровые (линии),
+   * территории/объекты ОКН (полигоны), красные линии. Можно несколько файлов сразу.
+   */
+  async loadGisLayer(files: File[], kind: GisLayerKind): Promise<void> {
+    const list = files.filter(Boolean);
+    if (list.length === 0) return;
+    this.dropzone.classList.add("hidden");
+    try {
+      await this.ensureMap();
+      await this.ensureProj4();
+    } catch (err) {
+      console.error(err);
+      this.setStatus(this.loadErr(err, "карты"));
+      return;
+    }
+    let ok = 0;
+    const errs: string[] = [];
+    for (const f of list) {
+      try {
+        await this.addGisLayer(f, kind);
+        ok++;
+      } catch (err) {
+        console.error(err);
+        errs.push(`${f.name} — ${this.loadErr(err)}`);
+      }
+    }
+    // если кроме слоёв ничего нет — отмасштабируемся к ним
+    this.redrawAll(this.models.length === 0 && this.boundaries.length === 0);
+    this.renderPanel();
+    const label = GIS_LAYER_TYPES[kind].label;
+    const head = ok > 0 ? `${label}: загружено файлов ${ok}` : `${label}: не загружено`;
     this.setStatus(errs.length ? `${head}. Ошибки: ${errs.join("; ")}` : head);
   }
 
@@ -229,7 +270,7 @@ export class GisView {
     else if (name.endsWith(".ifc")) await this.addIfc(file);
     else if (name.endsWith(".dwg")) await this.addDwg(file);
     else if (name.endsWith(".pdf")) await this.addGpzu(file);
-    else if (name.endsWith(".geojson") || name.endsWith(".json")) await this.addRedLines(file);
+    else if (name.endsWith(".geojson") || name.endsWith(".json")) await this.addGisLayer(file, "redlines");
     else throw new Error("неподдерживаемый тип файла");
   }
 
@@ -361,11 +402,8 @@ export class GisView {
     });
   }
 
-  /**
-   * Красные линии из GeoJSON (WGS84) → набор client-side слоя. Временно, пока
-   * импорт в metatiler не починен; потом заменим на тайлы 347001.
-   */
-  private async addRedLines(file: File): Promise<void> {
+  /** GeoJSON выбранного типа → тематический ГИС-слой (client-side) + перерисовка слоя. */
+  private async addGisLayer(file: File, kind: GisLayerKind): Promise<void> {
     const gj = JSON.parse(await file.text());
     const fc =
       gj?.type === "FeatureCollection"
@@ -373,30 +411,31 @@ export class GisView {
         : { type: "FeatureCollection", features: gj?.type === "Feature" ? [gj] : [] };
     const features: unknown[] = Array.isArray(fc.features) ? fc.features : [];
     if (features.length === 0) throw new Error("нет объектов (ожидался GeoJSON FeatureCollection)");
-    this.redlineSets.push({ id: `r${++this.seq}`, name: file.name, n: features.length, features });
-    this.rebuildRedlines();
-    this.redLinesToggle.checked = true;
-    this.setRedLinesVisible(true);
+    this.gisLayers.push({ id: `g${++this.seq}`, name: file.name, kind, n: features.length, features, visible: true });
+    this.rebuildLayer(kind);
   }
 
-  /** Пересобирает client-side слой красных линий из всех наборов (с учётом датума). */
-  private rebuildRedlines(): void {
-    const src = this.map?.getSource("redlines-local") as maplibregl.GeoJSONSource | undefined;
+  /** Пересобирает источник одного типа ГИС-слоёв из всех видимых наборов (с учётом датума). */
+  private rebuildLayer(kind: GisLayerKind): void {
+    const src = this.map?.getSource(GIS_LAYER_TYPES[kind].src) as maplibregl.GeoJSONSource | undefined;
     if (!src) return;
-    const raw = this.redlineSets.flatMap((s) => s.features);
-    const features =
-      this.redlinesDatum === "pulkovo" && this.proj4 ? raw.map((f) => this.reprojectRedline(f)) : raw;
+    const raw = this.gisLayers.filter((l) => l.kind === kind && l.visible).flatMap((l) => l.features);
+    const features = this.overlaysDatum === "pulkovo" && this.proj4 ? raw.map((f) => this.reprojectFeature(f)) : raw;
     src.setData({ type: "FeatureCollection", features } as any);
   }
 
-  /** Координата красной линии → WGS84 для карты (с учётом выбранного датума). */
-  private redlineLngLat(c: [number, number]): [number, number] {
-    if (this.redlinesDatum === "pulkovo" && this.proj4) return this.proj4(PULKOVO_GEO, "WGS84", c) as [number, number];
+  private rebuildAllLayers(): void {
+    for (const k of GIS_LAYER_KINDS) this.rebuildLayer(k);
+  }
+
+  /** Координата ГИС-слоя → WGS84 для карты (с учётом выбранного датума). */
+  private overlayLngLat(c: [number, number]): [number, number] {
+    if (this.overlaysDatum === "pulkovo" && this.proj4) return this.proj4(PULKOVO_GEO, "WGS84", c) as [number, number];
     return c;
   }
 
-  /** Глубокая репроекция geometry красной линии Пулково-1942 → WGS84 (без мутации исходника). */
-  private reprojectRedline(f: any): any {
+  /** Глубокая репроекция geometry Пулково-1942 → WGS84 (без мутации исходника). */
+  private reprojectFeature(f: any): any {
     const tx = (c: any): any =>
       Array.isArray(c) && typeof c[0] === "number"
         ? this.proj4(PULKOVO_GEO, "WGS84", c)
@@ -408,15 +447,23 @@ export class GisView {
     return { ...f, geometry: { ...g, coordinates: tx(g.coordinates) } };
   }
 
-  /** Переключает датум красных линий (WGS84 ↔ Пулково-1942/МСК-77) и пере-рисовывает. */
-  async setRedlinesDatum(d: "wgs84" | "pulkovo"): Promise<void> {
-    if (d === this.redlinesDatum) return;
-    this.redlinesDatum = d;
+  /** Переключает датум ВСЕХ городских ГИС-слоёв (WGS84 ↔ Пулково-1942/МСК-77). */
+  async setOverlaysDatum(d: "wgs84" | "pulkovo"): Promise<void> {
+    if (d === this.overlaysDatum) return;
+    this.overlaysDatum = d;
     await this.ensureProj4();
-    this.rebuildRedlines();
-    // если кроме линий ничего не загружено — переедем к ним (они сдвинулись)
+    this.rebuildAllLayers();
+    // если кроме слоёв ничего не загружено — переедем к ним (они сдвинулись)
     if (this.models.length === 0 && this.boundaries.length === 0) this.redrawAll(true);
-    this.setStatus(`Красные линии · датум: ${d === "pulkovo" ? "Пулково-1942/МСК-77 (+сдвиг)" : "WGS84 (как в файле)"}`);
+    this.setStatus(`ГИС-слои · датум: ${d === "pulkovo" ? "Пулково-1942/МСК-77 (+сдвиг)" : "WGS84 (как в файле)"}`);
+  }
+
+  /** Видимость одного загруженного ГИС-слоя (по id) — фильтрация в источнике типа. */
+  private toggleGisLayer(id: string, visible: boolean): void {
+    const l = this.gisLayers.find((x) => x.id === id);
+    if (!l) return;
+    l.visible = visible;
+    this.rebuildLayer(l.kind);
   }
 
   /** Авто-детект оси DWG→МСК-77: пробуем обе ориентации, берём попадание в Москву. */
@@ -440,16 +487,17 @@ export class GisView {
     const bounds = new maplibregl.LngLatBounds();
     this.drawModels(bounds);
     this.drawBoundaries(bounds);
-    // Если кроме красных линий ничего нет — учтём их в bounds, чтобы fit показал их.
+    // Если кроме ГИС-слоёв ничего нет — учтём их в bounds, чтобы fit показал их.
     if (this.models.length === 0 && this.boundaries.length === 0) {
-      for (const s of this.redlineSets)
-        for (const f of s.features) {
-          const g = (f as { geometry?: { coordinates?: unknown } })?.geometry;
-          walkLeafCoords(g?.coordinates, (c) => {
-            const ll = this.redlineLngLat(c);
-            if (Number.isFinite(ll[0]) && Math.abs(ll[1]) <= 90) bounds.extend(ll as [number, number]);
-          });
-        }
+      for (const l of this.gisLayers)
+        if (l.visible)
+          for (const f of l.features) {
+            const g = (f as { geometry?: { coordinates?: unknown } })?.geometry;
+            walkLeafCoords(g?.coordinates, (c) => {
+              const ll = this.overlayLngLat(c);
+              if (Number.isFinite(ll[0]) && Math.abs(ll[1]) <= 90) bounds.extend(ll as [number, number]);
+            });
+          }
     }
     if (fit && !bounds.isEmpty()) this.map.fitBounds(bounds, { padding: 70, maxZoom: 19, duration: 0 });
     this.map.resize();
@@ -559,19 +607,21 @@ export class GisView {
     this.markers = [];
   }
 
-  /** Удаляет загруженный элемент (модель/границу/кр.линии) по id и пере-рисовывает. */
+  /** Удаляет загруженный элемент (модель/границу/ГИС-слой) по id и пере-рисовывает. */
   removeItem(id: string): void {
     this.models = this.models.filter((m) => m.id !== id);
     this.boundaries = this.boundaries.filter((b) => b.id !== id);
-    const before = this.redlineSets.length;
-    this.redlineSets = this.redlineSets.filter((r) => r.id !== id);
-    if (this.redlineSets.length !== before) this.rebuildRedlines();
+    const removedLayer = this.gisLayers.find((l) => l.id === id);
+    if (removedLayer) {
+      this.gisLayers = this.gisLayers.filter((l) => l.id !== id);
+      this.rebuildLayer(removedLayer.kind);
+    }
     // перенумеруем цвета моделей по палитре после удаления
     this.models.forEach((m, i) => (m.color = MODEL_PALETTE[i % MODEL_PALETTE.length]));
     this.redrawAll(false);
     this.renderPanel();
     // если всё удалили — вернём центральную зону-приёмник файлов
-    if (this.models.length === 0 && this.boundaries.length === 0 && this.redlineSets.length === 0)
+    if (this.models.length === 0 && this.boundaries.length === 0 && this.gisLayers.length === 0)
       this.dropzone.classList.remove("hidden");
     this.setStatus("Элемент удалён");
   }
@@ -682,22 +732,24 @@ export class GisView {
       items.push(this.itemRow(m.id, m.kind.toUpperCase(), m.name, m.info, "gis-badge-model", m.color));
     for (const b of this.boundaries)
       items.push(this.itemRow(b.id, b.kind === "dwg" ? "DWG" : "ГПЗУ", b.name, b.info, b.ok ? "gis-badge-zu" : "gis-badge-warn"));
-    for (const r of this.redlineSets)
-      items.push(this.itemRow(r.id, "кр.линии", r.name, `${r.n} об.`, "gis-badge-rl"));
     const itemsHtml = items.length
       ? items.join("")
       : `<div class="gis-empty">Перетащите файлы (IFC / DWG / FBX / PDF / GeoJSON) или «Открыть файлы»</div>`;
 
-    // Датум красных линий: городские выгрузки (Мосдата/НСПД) часто в Пулково-1942 —
-    // тогда они «уезжают» ~110 м, если читать как WGS84. Переключатель чинит это.
-    const redlinesDatumHtml = this.redlineSets.length
-      ? `<label class="gis-rl-datum">Красные линии — датум:
-          <select id="gis-rl-datum">
-            <option value="wgs84"${this.redlinesDatum === "wgs84" ? " selected" : ""}>WGS84 (как в файле)</option>
-            <option value="pulkovo"${this.redlinesDatum === "pulkovo" ? " selected" : ""}>Пулково-1942 / МСК-77 (+сдвиг ~110 м)</option>
+    // ГИС-слои (кадастровые, ОКН, красные линии). Датум — общий: городские выгрузки
+    // (Мосдата/НСПД) часто в Пулково-1942 → «уезжают» ~110 м, если читать как WGS84.
+    const layerRows = this.gisLayers.map((l) => this.gisLayerRow(l)).join("");
+    const datumSel = this.gisLayers.length
+      ? `<label class="gis-rl-datum">Датум городских слоёв:
+          <select id="gis-overlays-datum">
+            <option value="wgs84"${this.overlaysDatum === "wgs84" ? " selected" : ""}>WGS84 (как в файле)</option>
+            <option value="pulkovo"${this.overlaysDatum === "pulkovo" ? " selected" : ""}>Пулково-1942 / МСК-77 (+сдвиг ~110 м)</option>
           </select>
         </label>`
       : "";
+    const layersBody = this.gisLayers.length
+      ? `${layerRows}${datumSel}`
+      : `<div class="gis-empty">Кадастровые (линии), территории/объекты ОКН, красные линии — через «+ ГИС-слой» в шапке.</div>`;
 
     const checkRows = (this.lastChecks || [])
       .map(
@@ -716,7 +768,10 @@ export class GisView {
       <div class="gis-panel-sec">
         <div class="gis-panel-head"><b>Загруженные данные</b></div>
         <div class="gis-items">${itemsHtml}</div>
-        ${redlinesDatumHtml}
+      </div>
+      <div class="gis-panel-sec">
+        <div class="gis-panel-head"><b>ГИС-слои</b></div>
+        <div class="gis-items">${layersBody}</div>
       </div>
       <div class="gis-panel-sec">
         <div class="gis-panel-head"><b>Проверки</b></div>
@@ -727,9 +782,12 @@ export class GisView {
     this.infoEl.querySelectorAll<HTMLButtonElement>("[data-del]").forEach((btn) =>
       btn.addEventListener("click", () => this.removeItem(btn.dataset.del!)),
     );
+    this.infoEl.querySelectorAll<HTMLInputElement>("[data-vis]").forEach((cb) =>
+      cb.addEventListener("change", () => this.toggleGisLayer(cb.dataset.vis!, cb.checked)),
+    );
     this.infoEl.querySelector<HTMLButtonElement>("#gis-run-checks")?.addEventListener("click", () => this.onShowChecks?.());
-    this.infoEl.querySelector<HTMLSelectElement>("#gis-rl-datum")?.addEventListener("change", (e) =>
-      void this.setRedlinesDatum((e.target as HTMLSelectElement).value as "wgs84" | "pulkovo"),
+    this.infoEl.querySelector<HTMLSelectElement>("#gis-overlays-datum")?.addEventListener("change", (e) =>
+      void this.setOverlaysDatum((e.target as HTMLSelectElement).value as "wgs84" | "pulkovo"),
     );
     if (hasModels) {
       this.wireCalibControls();
@@ -745,6 +803,17 @@ export class GisView {
       <span class="gis-item-name" title="${esc(name)}">${esc(name)}</span>
       <span class="gis-item-info">${esc(info)}</span>
       <button class="gis-item-del" data-del="${id}" title="убрать">✕</button>
+    </div>`;
+  }
+
+  private gisLayerRow(l: GisLayer): string {
+    const cfg = GIS_LAYER_TYPES[l.kind];
+    return `<div class="gis-item">
+      <input class="gis-vis" type="checkbox" data-vis="${l.id}"${l.visible ? " checked" : ""} title="видимость" />
+      <span class="gis-swatch" style="background:${cfg.color}"></span>
+      <span class="gis-item-name" title="${esc(l.name)}">${esc(cfg.label)}: ${esc(l.name)}</span>
+      <span class="gis-item-info">${l.n} об.</span>
+      <button class="gis-item-del" data-del="${l.id}" title="убрать">✕</button>
     </div>`;
   }
 
@@ -890,14 +959,6 @@ export class GisView {
     }
   }
 
-  private setRedLinesVisible(vis: boolean): void {
-    if (!this.map) return;
-    const v = vis ? "visible" : "none";
-    for (const id of ["rl-fill", "rl-line", "rll-fill", "rll-line"]) {
-      if (this.map.getLayer(id)) this.map.setLayoutProperty(id, "visibility", v);
-    }
-  }
-
   private async ensureProj4(): Promise<void> {
     if (this.proj4) return;
     this.proj4 = (await import("proj4")).default;
@@ -925,12 +986,6 @@ export class GisView {
             minzoom: 0,
             maxzoom: 16,
           },
-          redlines: {
-            type: "vector",
-            tiles: [`${METATILER_BASE}/tiles/${REDLINES_LAYER_ID}/{z}/{x}/{y}`],
-            minzoom: 0,
-            maxzoom: 16,
-          },
         },
         layers: [
           { id: "osm", type: "raster", source: "osm" },
@@ -947,23 +1002,6 @@ export class GisView {
             source: "cadastre",
             "source-layer": CADASTRE_SRC_LAYER,
             paint: { "line-color": CADASTRE_COLOR, "line-width": 0.8, "line-opacity": 0.7 },
-          },
-          {
-            id: "rl-fill",
-            type: "fill",
-            source: "redlines",
-            "source-layer": REDLINES_SRC_LAYER,
-            filter: ["==", ["geometry-type"], "Polygon"],
-            layout: { visibility: this.redLinesToggle.checked ? "visible" : "none" },
-            paint: { "fill-color": REDLINES_COLOR, "fill-opacity": 0.08 },
-          },
-          {
-            id: "rl-line",
-            type: "line",
-            source: "redlines",
-            "source-layer": REDLINES_SRC_LAYER,
-            layout: { visibility: this.redLinesToggle.checked ? "visible" : "none" },
-            paint: { "line-color": REDLINES_COLOR, "line-width": 1.6, "line-opacity": 0.9 },
           },
         ],
       },
@@ -996,24 +1034,25 @@ export class GisView {
       source: "target",
       paint: { "line-color": TARGET_COLOR, "line-width": 3 },
     });
-    // Красные линии из GeoJSON (client-side, WGS84) — временно, до тайлов metatiler.
-    const rlVis = this.redLinesToggle.checked ? "visible" : "none";
-    map.addSource("redlines-local", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-    map.addLayer({
-      id: "rll-fill",
-      type: "fill",
-      source: "redlines-local",
-      filter: ["==", ["geometry-type"], "Polygon"],
-      layout: { visibility: rlVis },
-      paint: { "fill-color": REDLINES_COLOR, "fill-opacity": 0.08 },
-    });
-    map.addLayer({
-      id: "rll-line",
-      type: "line",
-      source: "redlines-local",
-      layout: { visibility: rlVis },
-      paint: { "line-color": REDLINES_COLOR, "line-width": 1.6, "line-opacity": 0.95 },
-    });
+    // Тематические ГИС-слои (client-side GeoJSON): по источнику+заливке+линии на тип.
+    // Полигоны (ОКН) — заливка+контур; линии (кадастр/красные) — только контур виден.
+    for (const kind of GIS_LAYER_KINDS) {
+      const cfg = GIS_LAYER_TYPES[kind];
+      map.addSource(cfg.src, { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+      map.addLayer({
+        id: cfg.fill,
+        type: "fill",
+        source: cfg.src,
+        filter: ["==", ["geometry-type"], "Polygon"],
+        paint: { "fill-color": cfg.color, "fill-opacity": 0.12 },
+      });
+      map.addLayer({
+        id: cfg.line,
+        type: "line",
+        source: cfg.src,
+        paint: { "line-color": cfg.color, "line-width": 1.6, "line-opacity": 0.92 },
+      });
+    }
     // Участок из ГПЗУ — авторитетный эталон (МСК-77), ярко-зелёным.
     map.addSource("gpzu", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
     map.addLayer({

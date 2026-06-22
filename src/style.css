@@ -1005,6 +1005,28 @@ body {
   filter: brightness(1.08);
 }
 
+/* Загрузчик тематических ГИС-слоёв в топбаре (тип + кнопка) */
+.gis-layer-loader {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
+}
+.gis-layer-loader select {
+  background: var(--surface, #2a2b30);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 6px;
+  font-size: 12px;
+  cursor: pointer;
+  max-width: 160px;
+}
+.gis-vis {
+  flex: none;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 /* Переключатель кадастра в ГИС-топбаре */
 .gis-cad-toggle {
   display: inline-flex;
