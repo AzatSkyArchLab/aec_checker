@@ -9,6 +9,11 @@ public/web-ifc.wasm
 # ПРИВАТНЫЙ каталог проверок ЦИМ АГР (алгоритмы + НПА) — генерируется из xlsx,
 # в публичный репозиторий не попадает (только движок). См. scripts/gen-catalog.py
 public/checks-catalog.json
+public/checks-probemap.json
+
+# ПРИВАТНО: рабочие материалы по проверкам (DWG-чеклисты, build-скрипты, исходные PDF) —
+# валидационный моат, не для публичного репо
+docs/
 
 # Логи
 npm-debug.log*

@@ -250,6 +250,50 @@ export class GisView {
     }
   }
 
+  /**
+   * Загружает красные линии из GeoJSON (WGS84) и кладёт client-side слоем на карту.
+   * Временно, пока импорт в metatiler не починен; потом заменим на тайлы 347001.
+   */
+  async openRedLines(file: File): Promise<void> {
+    this.setStatus(`Чтение красных линий «${file.name}»…`);
+    this.dropzone.classList.add("hidden");
+    try {
+      await this.ensureMap();
+      const gj = JSON.parse(await file.text());
+      const fc =
+        gj?.type === "FeatureCollection"
+          ? gj
+          : { type: "FeatureCollection", features: gj?.type === "Feature" ? [gj] : [] };
+      const n = Array.isArray(fc.features) ? fc.features.length : 0;
+      if (n === 0) {
+        this.setStatus("В файле красных линий нет объектов (ожидался GeoJSON FeatureCollection)");
+        return;
+      }
+      (this.map!.getSource("redlines-local") as maplibregl.GeoJSONSource).setData(fc);
+      this.redLinesToggle.checked = true;
+      this.setRedLinesVisible(true);
+      // если модель/ЗУ ещё не загружены — подвинем карту к линиям, чтобы их было видно
+      if (!this.fbx && !this.gpzuRings) {
+        const b = new maplibregl.LngLatBounds();
+        let cnt = 0;
+        const extend = (c: unknown): void => {
+          if (Array.isArray(c) && typeof c[0] === "number") {
+            b.extend(c as [number, number]);
+            cnt++;
+          } else if (Array.isArray(c)) {
+            for (const x of c) extend(x);
+          }
+        };
+        for (const f of fc.features) extend((f as { geometry?: { coordinates?: unknown } })?.geometry?.coordinates);
+        if (cnt > 0) this.map!.fitBounds(b, { padding: 60, maxZoom: 16, duration: 0 });
+      }
+      this.setStatus(`Красные линии: ${file.name} · объектов: ${n}`);
+    } catch (err) {
+      console.error(err);
+      this.setStatus(`Ошибка чтения красных линий: ${(err as Error).message}`);
+    }
+  }
+
   /** Авто-детект оси DWG→МСК-77: пробуем обе ориентации, берём попадание в Москву. */
   private pickDwgAxis(rings: { pts: { x: number; y: number }[] }[]): (p: { x: number; y: number }) => GpzuPoint {
     let sx = 0, sy = 0, k = 0;
@@ -604,7 +648,7 @@ export class GisView {
   private setRedLinesVisible(vis: boolean): void {
     if (!this.map) return;
     const v = vis ? "visible" : "none";
-    for (const id of ["rl-fill", "rl-line"]) {
+    for (const id of ["rl-fill", "rl-line", "rll-fill", "rll-line"]) {
       if (this.map.getLayer(id)) this.map.setLayoutProperty(id, "visibility", v);
     }
   }
@@ -706,6 +750,24 @@ export class GisView {
       type: "line",
       source: "target",
       paint: { "line-color": TARGET_COLOR, "line-width": 3 },
+    });
+    // Красные линии из GeoJSON (client-side, WGS84) — временно, до тайлов metatiler.
+    const rlVis = this.redLinesToggle.checked ? "visible" : "none";
+    map.addSource("redlines-local", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({
+      id: "rll-fill",
+      type: "fill",
+      source: "redlines-local",
+      filter: ["==", ["geometry-type"], "Polygon"],
+      layout: { visibility: rlVis },
+      paint: { "fill-color": REDLINES_COLOR, "fill-opacity": 0.08 },
+    });
+    map.addLayer({
+      id: "rll-line",
+      type: "line",
+      source: "redlines-local",
+      layout: { visibility: rlVis },
+      paint: { "line-color": REDLINES_COLOR, "line-width": 1.6, "line-opacity": 0.95 },
     });
     // Участок из ГПЗУ — авторитетный эталон (МСК-77), ярко-зелёным.
     map.addSource("gpzu", { type: "geojson", data: { type: "FeatureCollection", features: [] } });

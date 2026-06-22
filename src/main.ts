@@ -372,6 +372,10 @@ async function initGis(): Promise<GisView> {
     const f = (e.target as HTMLInputElement).files?.[0];
     if (f) void view.openIfc(f);
   });
+  $<HTMLInputElement>("#gis-redlines-file").addEventListener("change", (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    if (f) void view.openRedLines(f);
+  });
   const gbody = $<HTMLElement>(".gis-body");
   const gdrop = $<HTMLElement>("#gis-dropzone");
   gbody.addEventListener("dragover", (e) => {
@@ -389,6 +393,7 @@ async function initGis(): Promise<GisView> {
     else if (name.endsWith(".ifc")) void view.openIfc(f);
     else if (name.endsWith(".pdf")) void view.openGpzu(f);
     else if (name.endsWith(".dwg")) void view.openDwg(f);
+    else if (name.endsWith(".geojson") || name.endsWith(".json")) void view.openRedLines(f);
   });
 
   // ── Проверка GIS-01: здание в границах ЗУ ──────────────────────────────────
