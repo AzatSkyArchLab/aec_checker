@@ -3,6 +3,7 @@ import maplibregl from "maplibre-gl";
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import type { GpzuPoint } from "./gpzu.ts";
+import { classifyRings, runGis01 as runGis01Calc, sketchSvg } from "./gis01.ts";
 
 /**
  * ГИС-режим: FBX в МСК-77 → нижний срез модели → точки на карте «как в FBX»,
@@ -268,16 +269,27 @@ export class GisView {
     if (!this.map || !this.gpzuRings) return;
     const map = this.map;
     const bounds = new maplibregl.LngLatBounds();
-    const features = this.gpzuRings.map((ring) => {
-      const coords = ring.map((p) => this.toWgs84(p.Y, p.X)); // Y=восток, X=север
-      for (const c of coords) {
-        if (Number.isFinite(c[0]) && Math.abs(c[1]) <= 90) bounds.extend(c);
-      }
-      const a = coords[0];
-      const z = coords[coords.length - 1];
-      if (a && z && (a[0] !== z[0] || a[1] !== z[1])) coords.push(a); // замкнуть кольцо
-      return { type: "Feature", geometry: { type: "Polygon", coordinates: [coords] }, properties: {} };
-    });
+    // Классифицируем кольца на внешние контуры + дырки → GeoJSON Polygon с дырками
+    // (MapLibre вырезает дырки в заливке).
+    const ringsEN: Pt[][] = this.gpzuRings.map((r) => r.map((p) => [p.Y, p.X] as Pt)); // [east,north]
+    const polys = classifyRings(ringsEN);
+    const toCoords = (ring: Pt[]): [number, number][] => {
+      const c = ring.map(([e, n]) => this.toWgs84(e, n)).filter((p) => Math.abs(p[1]) <= 90);
+      c.forEach((p) => bounds.extend(p));
+      const a = c[0], z = c[c.length - 1];
+      if (a && z && (a[0] !== z[0] || a[1] !== z[1])) c.push(a); // замкнуть
+      return c;
+    };
+    const features = polys
+      .filter((poly) => poly.exterior.length >= 3)
+      .map((poly) => ({
+        type: "Feature",
+        geometry: {
+          type: "Polygon",
+          coordinates: [toCoords(poly.exterior), ...poly.holes.filter((h) => h.length >= 3).map(toCoords)],
+        },
+        properties: {},
+      }));
     (map.getSource("gpzu") as maplibregl.GeoJSONSource).setData({
       type: "FeatureCollection",
       features,
@@ -335,9 +347,9 @@ export class GisView {
       this.setStatus("GIS-01: сначала загрузите ГПЗУ или DWG (границу ЗУ)");
       return null;
     }
-    const { runGis01, sketchSvg } = await import("./gis01.ts");
     const ringsEN: Pt[][] = this.gpzuRings.map((r) => r.map((p) => [p.Y, p.X] as Pt)); // [east,north]
-    const res = runGis01(this.fbx, ringsEN, (p) => this.toMskCal(p));
+    const parcelPolys = classifyRings(ringsEN); // внешние контуры + дырки
+    const res = runGis01Calc(this.fbx, parcelPolys, (p) => this.toMskCal(p));
 
     // Если объект ни одной точкой не попал в ЗУ — диагностируем геопривязку
     // (детально — в эскиз/отчёт; в заголовке оставляем краткий вердикт).

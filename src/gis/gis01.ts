@@ -36,7 +36,8 @@ export interface Gis01Result {
   levels: Gis01Level[];
   baseLevel: Gis01Level | null;
   exitLevel: Gis01Level | null; // первая высота с выходом за границы
-  parcelEN: Pt[]; // кольцо ЗУ [east, north]
+  parcelEN: Pt[]; // внешний контур ЗУ [east, north]
+  parcelHoles: Pt[][]; // дырки (исключённые внутренние области) ЗУ
   noOverlap: boolean; // объект НИ ОДНОЙ точкой не попал в ЗУ (проблема координат)
   offsetM: number; // расстояние центр объекта ↔ центр ЗУ, м
   buildingCentroidEN: Pt | null;
@@ -100,13 +101,58 @@ function ringArea(ring: Pt[]): number {
   return Math.abs(a) / 2;
 }
 
+/** Полигон ЗУ: внешний контур + дырки (исключённые внутренние области). */
+export interface PolyWithHoles {
+  exterior: Pt[];
+  holes: Pt[][];
+}
+
+/**
+ * Классифицирует набор замкнутых колец на полигоны с дырками по вложенности
+ * (правило even-odd): кольцо с чётной глубиной вложения — внешний контур,
+ * с нечётной — дырка, привязанная к ближайшему (наименьшему охватывающему) контуру.
+ * Так корректно разбираются: внешний+дырки, несколько участков, остров-в-дырке.
+ */
+export function classifyRings(rings: Pt[][]): PolyWithHoles[] {
+  const items = rings
+    .filter((r) => r.length >= 3)
+    .map((r) => ({ r, a: ringArea(r), c: centroidOf(r) as Pt }))
+    .sort((x, y) => y.a - x.a); // от большего к меньшему
+  const polys: PolyWithHoles[] = [];
+  const exteriorOf = new Map<Pt[], PolyWithHoles>();
+  for (const it of items) {
+    const containers = items.filter((o) => o !== it && o.a > it.a && pointInRing(it.c, o.r));
+    if (containers.length % 2 === 0) {
+      const poly: PolyWithHoles = { exterior: it.r, holes: [] };
+      polys.push(poly);
+      exteriorOf.set(it.r, poly);
+    } else {
+      const parent = containers.sort((a, b) => a.a - b.a)[0]; // ближайший охватывающий
+      const host = exteriorOf.get(parent.r);
+      if (host) host.holes.push(it.r);
+      else polys.push({ exterior: it.r, holes: [] }); // fallback (дырка в дырке)
+    }
+  }
+  return polys;
+}
+
+/** Точка внутри полигона с дырками: внутри внешнего И не в одной из дырок. */
+export function pointInPolygon(pt: Pt, exterior: Pt[], holes: Pt[][]): boolean {
+  if (!pointInRing(pt, exterior)) return false;
+  for (const h of holes) if (pointInRing(pt, h)) return false;
+  return true;
+}
+
 /**
  * Прогон GIS-01.
- * @param ringsEN кольца ГПЗУ в [east, north] (МСК-77); ЗУ = кольцо макс. площади.
+ * @param parcelPolys полигоны ЗУ в [east,north] (МСК-77) с дырками; ЗУ = полигон
+ *   макс. площади внешнего контура. Точка «в ЗУ» = внутри внешнего И не в дырке.
  * @param toMskCal перевод горизонтальных координат среза FBX в МСК-77 [east,north] с калибровкой.
  */
-export function runGis01(geom: FbxGeom, ringsEN: Pt[][], toMskCal: (p: Pt) => Pt): Gis01Result {
-  const parcelEN = ringsEN.slice().sort((a, b) => ringArea(b) - ringArea(a))[0] ?? [];
+export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: (p: Pt) => Pt): Gis01Result {
+  const parcel =
+    parcelPolys.slice().sort((a, b) => ringArea(b.exterior) - ringArea(a.exterior))[0] ?? { exterior: [], holes: [] };
+  const parcelEN = parcel.exterior;
   const base = geom.min[geom.vAxis];
   const top = geom.max[geom.vAxis];
   const levels: Gis01Level[] = [];
@@ -117,7 +163,7 @@ export function runGis01(geom: FbxGeom, ringsEN: Pt[][], toMskCal: (p: Pt) => Pt
     const outsideEN: Pt[] = [];
     for (const p of raw) {
       const en = toMskCal(p);
-      if (pointInRing(en, parcelEN)) insideEN.push(en);
+      if (pointInPolygon(en, parcel.exterior, parcel.holes)) insideEN.push(en);
       else outsideEN.push(en);
     }
     levels.push({
@@ -165,7 +211,7 @@ export function runGis01(geom: FbxGeom, ringsEN: Pt[][], toMskCal: (p: Pt) => Pt
     status = "warn";
     summary = `Нижняя часть в пределах ЗУ; с высоты ${exitLevel.hRel} м часть выступает за границы ЗУ (${exitLevel.outside} точек).`;
   }
-  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN, noOverlap, offsetM, buildingCentroidEN };
+  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN, parcelHoles: parcel.holes, noOverlap, offsetM, buildingCentroidEN };
 }
 
 function centroidOf(ring: Pt[]): Pt | null {
@@ -219,7 +265,10 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
   const X = (e: number) => ox + (e - minE) * s;
   const Y = (n: number) => oy + (maxN - n) * s;
 
-  const ringPath = res.parcelEN.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ") + " Z";
+  const ringToPath = (ring: Pt[]) =>
+    ring.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ") + " Z";
+  // Внешний контур + дырки одним path с fill-rule=evenodd → дырки вырезаются.
+  const ringPath = [res.parcelEN, ...(res.parcelHoles || [])].map(ringToPath).join(" ");
   const dots = (pts: Pt[], color: string, r: number) =>
     pts.map((p) => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="${r}" fill="${color}"/>`).join("");
 
@@ -251,7 +300,7 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
   <text x="${pad}" y="22" font-size="15" font-weight="bold" fill="#222">GIS-01 · Здание в границах ЗУ — вид сверху</text>
   <text x="${pad}" y="38" font-size="11" fill="${statusColor}" font-weight="bold">${statusText}</text>
   ${opts?.cad ? `<text x="${W - pad}" y="22" font-size="11" fill="#555" text-anchor="end">ЗУ ${opts.cad}</text>` : ""}
-  <path d="${ringPath}" fill="#16a34a" fill-opacity="0.08" stroke="#16a34a" stroke-width="2"/>
+  <path d="${ringPath}" fill="#16a34a" fill-opacity="0.08" fill-rule="evenodd" stroke="#16a34a" stroke-width="2"/>
   ${res.baseLevel ? dots(res.baseLevel.insideEN, "#1f9d55", 1.7) : ""}
   ${res.exitLevel ? dots(res.exitLevel.insideEN, "#9aa0a6", 1.4) : ""}
   ${res.exitLevel ? dots(res.exitLevel.outsideEN, "#e2241a", 2.4) : ""}
