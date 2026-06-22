@@ -354,6 +354,7 @@ async function initGis(): Promise<GisView> {
     $("#gis-info"),
     $("#gis-dropzone"),
     $<HTMLInputElement>("#gis-cadastre"),
+    $<HTMLInputElement>("#gis-redlines"),
   );
   $<HTMLInputElement>("#gis-file").addEventListener("change", (e) => {
     const f = (e.target as HTMLInputElement).files?.[0];

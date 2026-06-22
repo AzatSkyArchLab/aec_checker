@@ -18,6 +18,9 @@ const MSK77 =
 const METATILER_BASE = "https://meta-tiler-stage.metapolis.su";
 const CADASTRE_LAYER_ID = 101;
 const CADASTRE_SRC_LAYER = "main"; // имя source-layer в MVT этого сервера
+const REDLINES_LAYER_ID = 347001; // красные линии (импорт в metatiler)
+const REDLINES_SRC_LAYER = "main";
+const REDLINES_COLOR = "#dc2626";
 const OSM_TILES = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png";
 
 const FOOTPRINT_COLOR = "#e8590c";
@@ -59,9 +62,13 @@ export class GisView {
     private infoEl: HTMLElement,
     private dropzone: HTMLElement,
     private cadastreToggle: HTMLInputElement,
+    private redLinesToggle: HTMLInputElement,
   ) {
     this.cadastreToggle.addEventListener("change", () => {
       this.setCadastreVisible(this.cadastreToggle.checked);
+    });
+    this.redLinesToggle.addEventListener("change", () => {
+      this.setRedLinesVisible(this.redLinesToggle.checked);
     });
     try {
       const saved = JSON.parse(localStorage.getItem("gis-calib") || "null");
@@ -535,6 +542,14 @@ export class GisView {
     }
   }
 
+  private setRedLinesVisible(vis: boolean): void {
+    if (!this.map) return;
+    const v = vis ? "visible" : "none";
+    for (const id of ["rl-fill", "rl-line"]) {
+      if (this.map.getLayer(id)) this.map.setLayoutProperty(id, "visibility", v);
+    }
+  }
+
   private async ensureProj4(): Promise<void> {
     if (this.proj4) return;
     this.proj4 = (await import("proj4")).default;
@@ -562,6 +577,12 @@ export class GisView {
             minzoom: 0,
             maxzoom: 16,
           },
+          redlines: {
+            type: "vector",
+            tiles: [`${METATILER_BASE}/tiles/${REDLINES_LAYER_ID}/{z}/{x}/{y}`],
+            minzoom: 0,
+            maxzoom: 16,
+          },
         },
         layers: [
           { id: "osm", type: "raster", source: "osm" },
@@ -578,6 +599,23 @@ export class GisView {
             source: "cadastre",
             "source-layer": CADASTRE_SRC_LAYER,
             paint: { "line-color": CADASTRE_COLOR, "line-width": 0.8, "line-opacity": 0.7 },
+          },
+          {
+            id: "rl-fill",
+            type: "fill",
+            source: "redlines",
+            "source-layer": REDLINES_SRC_LAYER,
+            filter: ["==", ["geometry-type"], "Polygon"],
+            layout: { visibility: this.redLinesToggle.checked ? "visible" : "none" },
+            paint: { "fill-color": REDLINES_COLOR, "fill-opacity": 0.08 },
+          },
+          {
+            id: "rl-line",
+            type: "line",
+            source: "redlines",
+            "source-layer": REDLINES_SRC_LAYER,
+            layout: { visibility: this.redLinesToggle.checked ? "visible" : "none" },
+            paint: { "line-color": REDLINES_COLOR, "line-width": 1.6, "line-opacity": 0.9 },
           },
         ],
       },
