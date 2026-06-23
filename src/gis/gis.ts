@@ -3,8 +3,8 @@ import maplibregl from "maplibre-gl";
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import type { GpzuPoint } from "./gpzu.ts";
-import { classifyRings, runGis01 as runGis01Calc, sketchSvg } from "./gis01.ts";
-import type { FbxGeom } from "./gis01.ts";
+import { classifyRings, runGis01 as runGis01Calc, sketchSvg, polysIntersect, lineHitsPolys, polylinesIntersect, convexHull, bboxOf, bboxOverlap } from "./gis01.ts";
+import type { FbxGeom, PolyWithHoles } from "./gis01.ts";
 
 /**
  * ГИС-режим: FBX в МСК-77 → нижний срез модели → точки на карте «как в FBX»,
@@ -83,15 +83,34 @@ interface GisLayer {
   visible: boolean;
 }
 
-/** Результат GIS-01 по одной модели — для модалки и панели. */
-export interface ModelCheckResult {
-  modelId: string;
+/** Статус проверки: ок / предупреждение / нарушение / неприменимо. */
+export type CheckStatus = "pass" | "warn" | "fail" | "na";
+/** Строка результата проверки (по модели / границе / источнику данных). */
+export interface CheckRow {
+  subject: string;
+  color?: string;
+  status: CheckStatus;
+  detail: string;
+  svg?: string; // эскиз (вид сверху) — для GIS-01
+}
+/** Результат одной проверки ГИС (с несколькими строками-субъектами). */
+export interface CheckResult {
+  id: string;
   name: string;
-  color: string;
-  status: "pass" | "warn" | "fail";
-  summary: string;
-  diagnostic: string;
-  svg: string;
+  status: CheckStatus;
+  rows: CheckRow[];
+}
+
+/** Худший статус среди строк (fail > warn > pass > na). */
+function worstStatus(rows: CheckRow[]): CheckStatus {
+  if (rows.some((r) => r.status === "fail")) return "fail";
+  if (rows.some((r) => r.status === "warn")) return "warn";
+  if (rows.some((r) => r.status === "pass")) return "pass";
+  return "na";
+}
+/** В пределах Москвы (грубая проверка «координаты в МСК-77»). */
+function inMoscowLL(ll: Pt): boolean {
+  return Number.isFinite(ll[0]) && ll[1] >= 55.09 && ll[1] <= 56.08 && ll[0] >= 36.75 && ll[0] <= 38.0;
 }
 
 export class GisView {
@@ -129,8 +148,8 @@ export class GisView {
   /** Тематические ГИС-слои (красные линии / кадастровые / ОКН) из GeoJSON. */
   private gisLayers: GisLayer[] = [];
   private seq = 0;
-  /** Последний прогон GIS-01 (для перерисовки панели). */
-  private lastChecks: ModelCheckResult[] | null = null;
+  /** Последний прогон проверок (для перерисовки панели). */
+  private lastChecks: CheckResult[] | null = null;
   /** Колбэк «показать отчёт проверок» (модалку открывает main.ts). */
   private onShowChecks: (() => void) | null = null;
 
@@ -534,6 +553,15 @@ export class GisView {
           coords.forEach(ext);
         }
       }
+      // Точечное облако: контура-меша нет → рисуем полигон выпуклой оболочки среза.
+      if (m.geom.isCloud && m.footprint.points.length >= 3) {
+        const hull = convexHull(m.footprint.points);
+        const coords = hull.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
+        if (coords.length >= 3) {
+          features.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [coords] }, properties: { k: "ring", color } });
+          coords.forEach(ext);
+        }
+      }
       for (const p of m.footprint.points) {
         const c = this.ll(p);
         if (Math.abs(c[1]) <= 90) {
@@ -650,35 +678,215 @@ export class GisView {
   }
 
   /**
-   * Проверка GIS-01 «Здание полностью в границах ЗУ» — по КАЖДОЙ модели.
-   * Нужны хотя бы одна граница ЗУ (ГПЗУ/DWG) и хотя бы одна модель (FBX/IFC).
-   * Каждая модель проверяется против ОБЪЕДИНЕНИЯ всех границ; возвращается список
-   * вердиктов (по модели) + SVG-эскиз каждой. Сами вычисления — в gis01.ts.
+   * Прогон всех ГИС-проверок (GIS-01/02/04/06). Возвращает список результатов
+   * (по проверке → строки по моделям/границам/источникам). Геометрия коллизий — gis01.ts.
    */
-  runAllChecks(): { perModel: ModelCheckResult[]; counts: { pass: number; warn: number; fail: number } } | null {
-    if (this.models.length === 0) {
-      this.setStatus("GIS-01: сначала загрузите модель (FBX/IFC)");
+  runChecks(): CheckResult[] | null {
+    if (this.models.length === 0 && this.boundaries.length === 0 && this.gisLayers.length === 0) {
+      this.setStatus("Проверки: сначала загрузите данные (модель / границу ЗУ / ГИС-слои)");
       return null;
     }
-    if (this.boundaries.length === 0) {
-      this.setStatus("GIS-01: сначала загрузите ГПЗУ или DWG (границу ЗУ)");
-      return null;
+    const results = [this.checkGis01(), this.checkGis02(), this.checkGis04(), this.checkGis06()];
+    this.lastChecks = results;
+    this.renderPanel();
+    const f = results.filter((r) => r.status === "fail").length;
+    const w = results.filter((r) => r.status === "warn").length;
+    this.setStatus(`Проверки ГИС: ${results.length} — нарушений ${f}, предупреждений ${w}`);
+    return results;
+  }
+
+  /** Объединение всех границ ЗУ в полигоны [east,north] (МСК-77). */
+  private parcelPolysEN(): PolyWithHoles[] {
+    return this.boundaries.flatMap((b) => classifyRings(b.rings.map((r) => r.map((p) => [p.Y, p.X] as Pt))));
+  }
+  /** Граница ЗУ → полигоны в WGS84 (без калибровки — авторитетный эталон). */
+  private boundaryPolysWgs(b: Boundary): PolyWithHoles[] {
+    return classifyRings(b.rings.map((r) => r.map((p) => this.toWgs84(p.Y, p.X))));
+  }
+  /**
+   * Контур среза модели в WGS84 (по всем уровням — ловит свесы; облако → выпуклая
+   * оболочка). Возвращает замкнутые полигоны + разомкнутые ломаные (несшитые стены)
+   * + общий bbox — для коллизий.
+   */
+  private modelFootprintGeomWgs(m: PlacedModel): { polys: PolyWithHoles[]; lines: Pt[][]; bbox: [number, number, number, number] } {
+    const g = m.geom;
+    const ringsModel: Pt[][] = [];
+    const linesModel: Pt[][] = [];
+    if (g.isCloud) {
+      const hull = convexHull(m.footprint.points);
+      if (hull.length >= 3) ringsModel.push(hull);
+    } else {
+      const base = g.min[g.vAxis], top = g.max[g.vAxis];
+      const step = Math.max((top - base) / 8, 1.5);
+      for (let h = base + 0.01; h <= top + 1e-6; h += step) {
+        const fp = sliceFootprint(g.meshes, g.vAxis, g.hA, g.hB, h);
+        ringsModel.push(...fp.rings);
+        linesModel.push(...fp.lines);
+      }
+      if (ringsModel.length === 0 && linesModel.length === 0) {
+        ringsModel.push(...m.footprint.rings);
+        linesModel.push(...m.footprint.lines);
+      }
     }
-    // Объединение всех границ ЗУ (внешние контуры + дырки из всех источников).
-    const parcelPolys = this.boundaries.flatMap((b) =>
-      classifyRings(b.rings.map((r) => r.map((p) => [p.Y, p.X] as Pt))),
-    );
-    const perModel: ModelCheckResult[] = this.models.map((m) => {
-      const res = runGis01Calc(m.geom, parcelPolys, (p) => this.toMskCal(p));
-      const diagnostic = res.noOverlap ? this.geoDiagnostic(m.geo) : "";
-      const svg = sketchSvg(res, { diagnostic, file: `${m.name} (${m.kind.toUpperCase()})` });
-      return { modelId: m.id, name: m.name, color: m.color, status: res.status, summary: res.summary, diagnostic, svg };
-    });
-    const counts = { pass: 0, warn: 0, fail: 0 };
-    for (const r of perModel) counts[r.status]++;
-    this.setStatus(`GIS-01 · моделей: ${perModel.length} — ✓${counts.pass} ⚠${counts.warn} ✗${counts.fail}`);
-    this.renderPanel(perModel);
-    return { perModel, counts };
+    const toW = (r: Pt[]) => r.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
+    const polys: PolyWithHoles[] = ringsModel.filter((r) => r.length >= 3).map((r) => ({ exterior: toW(r), holes: [] }));
+    const lines = linesModel.filter((r) => r.length >= 2).map(toW);
+    const allRings = [...polys.map((p) => p.exterior), ...lines];
+    return { polys, lines, bbox: bboxOf(allRings.length ? allRings : [[[NaN, NaN]]]) };
+  }
+  /**
+   * Линии ГИС-слоя одного типа в WGS84 (с датумом), отфильтрованные по bbox — чтобы
+   * не материализовать целиком огромный GeoJSON (красные линии могут быть >100 МБ).
+   * Сырой bbox объекта считаем без аллокаций (walkLeafCoords) и сравниваем с clip
+   * (clip с запасом перекрывает датум-сдвиг ~110 м).
+   */
+  private overlayLinesWgsClipped(kind: GisLayerKind, clip: [number, number, number, number]): Pt[][] {
+    const out: Pt[][] = [];
+    const c = (p: Pt): Pt => this.overlayLngLat(p);
+    const collect = (g: any): void => {
+      if (!g) return;
+      if (g.type === "LineString") out.push((g.coordinates as Pt[]).map(c));
+      else if (g.type === "MultiLineString") for (const l of g.coordinates) out.push((l as Pt[]).map(c));
+      else if (g.type === "Polygon") for (const r of g.coordinates) out.push((r as Pt[]).map(c));
+      else if (g.type === "MultiPolygon") for (const poly of g.coordinates) for (const r of poly) out.push((r as Pt[]).map(c));
+      else if (g.type === "GeometryCollection") for (const gg of g.geometries) collect(gg);
+    };
+    for (const l of this.gisLayers) {
+      if (l.kind !== kind || !l.visible) continue;
+      for (const f of l.features) {
+        const g = (f as { geometry?: { coordinates?: unknown } })?.geometry;
+        if (!g) continue;
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        walkLeafCoords((g as any).coordinates, (p) => { if (p[0] < x0) x0 = p[0]; if (p[1] < y0) y0 = p[1]; if (p[0] > x1) x1 = p[0]; if (p[1] > y1) y1 = p[1]; });
+        if (bboxOverlap([x0, y0, x1, y1], clip)) collect(g);
+      }
+    }
+    return out;
+  }
+  /** Полигоны ГИС-слоёв одного типа в WGS84 (каждое кольцо — отдельный полигон, консервативно). */
+  private overlayPolysWgs(kind: GisLayerKind): PolyWithHoles[] {
+    const c = (p: Pt): Pt => this.overlayLngLat(p);
+    const polys: PolyWithHoles[] = [];
+    const walk = (g: any): void => {
+      if (!g) return;
+      if (g.type === "Polygon") for (const r of g.coordinates) polys.push({ exterior: (r as Pt[]).map(c), holes: [] });
+      else if (g.type === "MultiPolygon") for (const poly of g.coordinates) for (const r of poly) polys.push({ exterior: (r as Pt[]).map(c), holes: [] });
+      else if (g.type === "GeometryCollection") for (const gg of g.geometries) walk(gg);
+    };
+    for (const l of this.gisLayers) if (l.kind === kind && l.visible) for (const f of l.features) walk((f as any)?.geometry);
+    return polys.filter((p) => p.exterior.length >= 3);
+  }
+  private hasVisibleLayer(kind: GisLayerKind): boolean {
+    return this.gisLayers.some((l) => l.kind === kind && l.visible);
+  }
+
+  /** GIS-01: здание в границах ЗУ (коллизия с границей) — по каждой модели. */
+  private checkGis01(): CheckResult {
+    const rows: CheckRow[] = [];
+    if (this.models.length === 0) rows.push({ subject: "—", status: "na", detail: "нет модели (FBX/IFC)" });
+    else if (this.boundaries.length === 0) rows.push({ subject: "—", status: "na", detail: "нет границы ЗУ (ГПЗУ/DWG)" });
+    else {
+      const polys = this.parcelPolysEN();
+      for (const m of this.models) {
+        const res = runGis01Calc(m.geom, polys, (p) => this.toMskCal(p));
+        const diag = res.noOverlap ? this.geoDiagnostic(m.geo) : "";
+        const svg = sketchSvg(res, { diagnostic: diag, file: `${m.name} (${m.kind.toUpperCase()})` });
+        rows.push({ subject: m.name, color: m.color, status: res.status, detail: res.summary, svg });
+      }
+    }
+    return { id: "GIS-01", name: "Здание в границах ЗУ", rows, status: worstStatus(rows) };
+  }
+
+  /** GIS-02: срез здания не должен пересекать красные линии (отступ соблюдён). */
+  private checkGis02(): CheckResult {
+    const rows: CheckRow[] = [];
+    if (!this.hasVisibleLayer("redlines")) rows.push({ subject: "—", status: "na", detail: "нет данных по красным линиям (загрузите ГИС-слой)" });
+    else if (this.models.length === 0) rows.push({ subject: "—", status: "na", detail: "нет модели (FBX/IFC)" });
+    else {
+      const geoms = this.models.map((m) => ({ m, ...this.modelFootprintGeomWgs(m) }));
+      // Единый clip-bbox по всем моделям (+~1 км) — фильтруем красные линии один раз.
+      const clip = expandBox(unionBox(geoms.map((x) => x.bbox)), 0.012);
+      const redLines = this.overlayLinesWgsClipped("redlines", clip);
+      const note = this.overlaysDatum === "wgs84" ? " · датум слоёв: WGS84 (если линии уехали — переключите на Пулково)" : "";
+      for (const { m, polys, lines, bbox } of geoms) {
+        if (polys.length === 0 && lines.length === 0) { rows.push({ subject: m.name, color: m.color, status: "na", detail: "не удалось построить контур среза" }); continue; }
+        const near = redLines.filter((rl) => bboxOverlap(bbox, bboxOf([rl])));
+        const hit = near.some((rl) => lineHitsPolys(rl, polys) || lines.some((bl) => polylinesIntersect(rl, bl)));
+        rows.push({
+          subject: m.name,
+          color: m.color,
+          status: hit ? "fail" : "pass",
+          detail: (hit
+            ? "срез здания ПЕРЕСЕКАЕТ красную линию — отступ не соблюдён"
+            : "пересечений с красными линиями нет — отступ соблюдён (с исключениями)") + note,
+        });
+      }
+    }
+    return { id: "GIS-02", name: "Отступ от красных линий", rows, status: worstStatus(rows) };
+  }
+
+  /** GIS-04: координаты данных в МСК-77 (эвристика — попадание в пределы Москвы). */
+  private checkGis04(): CheckResult {
+    const rows: CheckRow[] = [];
+    for (const m of this.models) {
+      const c = this.ll(m.center);
+      if (m.geo.source === "ifc") {
+        if (m.geo.ok && m.geo.inMoscow) rows.push({ subject: m.name, color: m.color, status: "pass", detail: `IFC: геопривязка ${m.geo.method} → МСК-77 (в Москве)` });
+        else if (m.geo.ok) rows.push({ subject: m.name, color: m.color, status: "fail", detail: `IFC: геопривязка ведёт ВНЕ Москвы (${m.geo.lat?.toFixed(4)}, ${m.geo.lng?.toFixed(4)}) — не МСК-77` });
+        else rows.push({ subject: m.name, color: m.color, status: inMoscowLL(c) ? "warn" : "fail", detail: inMoscowLL(c) ? "IFC: явной геопривязки нет, но геометрия в пределах Москвы (вероятно МСК-77)" : "IFC: нет геопривязки и геометрия вне Москвы" });
+      } else {
+        rows.push({ subject: m.name, color: m.color, status: inMoscowLL(c) ? "pass" : "fail", detail: inMoscowLL(c) ? "FBX: геометрия в пределах Москвы (координаты в МСК-77)" : "FBX: координаты вне Москвы — не МСК-77" });
+      }
+    }
+    for (const b of this.boundaries) {
+      let sX = 0, sY = 0, n = 0;
+      for (const r of b.rings) for (const p of r) { sX += p.X; sY += p.Y; n++; }
+      const c = n > 0 ? this.toWgs84(sY / n, sX / n) : ([NaN, NaN] as Pt);
+      rows.push({ subject: b.name, status: inMoscowLL(c) ? "pass" : "fail", detail: inMoscowLL(c) ? `${b.kind === "dwg" ? "DWG" : "ГПЗУ"}: координаты в МСК-77 (в Москве)` : `${b.kind === "dwg" ? "DWG" : "ГПЗУ"}: координаты вне Москвы — проверьте СК` });
+    }
+    for (const l of this.gisLayers) {
+      if (!l.visible) continue;
+      const first = this.firstCoord(l);
+      const c = first ? this.overlayLngLat(first) : ([NaN, NaN] as Pt);
+      rows.push({ subject: `${GIS_LAYER_TYPES[l.kind].label}: ${l.name}`, status: inMoscowLL(c) ? "pass" : "fail", detail: inMoscowLL(c) ? "GeoJSON: координаты в пределах Москвы" : "GeoJSON: координаты вне Москвы — проверьте СК/датум" });
+    }
+    if (rows.length === 0) rows.push({ subject: "—", status: "na", detail: "нет данных для проверки" });
+    return { id: "GIS-04", name: "Координаты в GeoJSON/IFC в МСК-77", rows, status: worstStatus(rows) };
+  }
+
+  /** GIS-06: участок (ЗУ) не пересекается с зоной охраны/объектом ОКН. */
+  private checkGis06(): CheckResult {
+    const rows: CheckRow[] = [];
+    const hasOkn = this.hasVisibleLayer("okn-territory") || this.hasVisibleLayer("okn-object");
+    if (!hasOkn) rows.push({ subject: "—", status: "na", detail: "нет полигонов ОКН (загрузите территории/объекты ОКН)" });
+    else if (this.boundaries.length === 0) rows.push({ subject: "—", status: "na", detail: "нет границы ЗУ" });
+    else {
+      const okn = [...this.overlayPolysWgs("okn-territory"), ...this.overlayPolysWgs("okn-object")];
+      const note = this.overlaysDatum === "wgs84" ? " · датум слоёв: WGS84 (если ОКН уехали — переключите на Пулково)" : "";
+      for (const b of this.boundaries) {
+        const zu = this.boundaryPolysWgs(b);
+        const hit = polysIntersect(zu, okn);
+        rows.push({
+          subject: b.name,
+          status: hit ? "fail" : "pass",
+          detail: (hit
+            ? "участок ПЕРЕСЕКАЕТ зону охраны/объект ОКН — нужны обмеры или исключение"
+            : "пересечений с ОКН нет") + note,
+        });
+      }
+    }
+    return { id: "GIS-06", name: "Пересечение ЗУ с зоной охраны ОКН", rows, status: worstStatus(rows) };
+  }
+
+  /** Первая координата [lng,lat] (как в файле) первого объекта слоя. */
+  private firstCoord(l: GisLayer): Pt | null {
+    for (const f of l.features) {
+      const g = (f as { geometry?: { coordinates?: unknown } })?.geometry;
+      let found: Pt | null = null;
+      walkLeafCoords(g?.coordinates, (c) => { if (!found) found = c; });
+      if (found) return found;
+    }
+    return null;
   }
 
   /** Диагностика геопривязки конкретной модели для случая «объект вне ЗУ». */
@@ -721,11 +929,11 @@ export class GisView {
   }
 
   /** Левая панель: загруженные данные (с удалением) + проверки + калибровка. */
-  renderPanel(checks?: ModelCheckResult[]): void {
+  renderPanel(checks?: CheckResult[]): void {
     if (checks) this.lastChecks = checks;
     this.infoEl.hidden = false;
     const hasModels = this.models.length > 0;
-    const canCheck = hasModels && this.boundaries.length > 0;
+    const canCheck = hasModels || this.boundaries.length > 0 || this.gisLayers.length > 0;
 
     const items: string[] = [];
     for (const m of this.models)
@@ -751,18 +959,19 @@ export class GisView {
       ? `${layerRows}${datumSel}`
       : `<div class="gis-empty">Кадастровые (линии), территории/объекты ОКН, красные линии — через «+ ГИС-слой» в шапке.</div>`;
 
+    const badge = (s: CheckStatus) => (s === "pass" ? "✓" : s === "warn" ? "⚠" : s === "fail" ? "✗" : "—");
     const checkRows = (this.lastChecks || [])
       .map(
         (c) => `<div class="gis-check-item">
-          <span class="gis-swatch" style="background:${c.color}"></span>
-          <span class="gis-check-name" title="${esc(c.summary)}">${esc(c.name)}</span>
-          <span class="gis-check-badge status-${c.status}">${c.status === "pass" ? "✓" : c.status === "warn" ? "⚠" : "✗"}</span>
+          <span class="gis-check-id">${esc(c.id)}</span>
+          <span class="gis-check-name" title="${esc(c.name)}">${esc(c.name)}</span>
+          <span class="gis-check-badge status-${c.status === "na" ? "warn" : c.status}">${badge(c.status)}</span>
         </div>`,
       )
       .join("");
     const checksBody = canCheck
-      ? `<button id="gis-run-checks" class="gis-run-checks">▶ GIS-01 · здание в границах ЗУ</button>${checkRows ? `<div class="gis-check-list">${checkRows}</div>` : ""}`
-      : `<div class="gis-empty">Загрузите модель (FBX/IFC) и границу ЗУ (ГПЗУ/DWG)</div>`;
+      ? `<button id="gis-run-checks" class="gis-run-checks">▶ Запустить проверки ГИС</button>${checkRows ? `<div class="gis-check-list">${checkRows}</div>` : ""}`
+      : `<div class="gis-empty">Загрузите данные (модель / границу ЗУ / ГИС-слои)</div>`;
 
     this.infoEl.innerHTML = `
       <div class="gis-panel-sec">
@@ -1144,6 +1353,20 @@ function walkLeafCoords(c: unknown, fn: (p: [number, number]) => void): void {
   if (Array.isArray(c) && typeof c[0] === "number") fn(c as [number, number]);
   else if (Array.isArray(c)) for (const x of c) walkLeafCoords(x, fn);
 }
+type Box = [number, number, number, number];
+/** Объединение bbox-ов (игнорируя пустые/NaN). */
+function unionBox(boxes: Box[]): Box {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const b of boxes) {
+    if (!Number.isFinite(b[0])) continue;
+    if (b[0] < x0) x0 = b[0]; if (b[1] < y0) y0 = b[1]; if (b[2] > x1) x1 = b[2]; if (b[3] > y1) y1 = b[3];
+  }
+  return [x0, y0, x1, y1];
+}
+/** Расширяет bbox на m по каждой стороне (в градусах для WGS84). */
+function expandBox(b: Box, m: number): Box {
+  return [b[0] - m, b[1] - m, b[2] + m, b[3] + m];
+}
 
 // ── Геометрия FBX ────────────────────────────────────────────────────────────
 
@@ -1329,5 +1552,42 @@ function stitch(segs: [Pt, Pt][]): { loops: Pt[][]; open: Pt[][] } {
     if (cur === first && path.length >= 4) loops.push(pts);
     else if (pts.length >= 2) open.push(pts);
   }
-  return { loops, open };
+  // Сшиваем открытые фрагменты по совпадающим концам и замыкаем почти-замкнутые —
+  // чтобы срез меша давал цельный полигон контура, а не набор линий.
+  return chainAndClose(loops, open, key);
+}
+
+/** Жадно склеивает открытые пути по общим концам, замыкает совпавшие в кольца. */
+function chainAndClose(loops: Pt[][], open: Pt[][], key: (p: Pt) => string): { loops: Pt[][]; open: Pt[][] } {
+  if (open.length > 1500) return { loops, open }; // защита от O(n²) на «грязных» мешах
+  let paths = open.map((p) => p.slice());
+  let guard = 0;
+  let merged = true;
+  while (merged && guard++ < paths.length + 5) {
+    merged = false;
+    const endIndex = new Map<string, number[]>();
+    const addEnd = (k: string, i: number) => (endIndex.get(k) ?? endIndex.set(k, []).get(k)!).push(i);
+    paths.forEach((p, i) => { addEnd(key(p[0]), i); addEnd(key(p[p.length - 1]), i); });
+    const removed = new Set<number>();
+    for (let i = 0; i < paths.length; i++) {
+      if (removed.has(i)) continue;
+      const A = paths[i];
+      const aEnd = key(A[A.length - 1]);
+      const j = (endIndex.get(aEnd) || []).find((x) => x !== i && !removed.has(x));
+      if (j == null) continue;
+      const B = paths[j];
+      if (key(B[0]) === aEnd) paths[i] = A.concat(B.slice(1));
+      else if (key(B[B.length - 1]) === aEnd) paths[i] = A.concat(B.slice(0, -1).reverse());
+      else continue;
+      removed.add(j);
+      merged = true;
+    }
+    if (removed.size) paths = paths.filter((_, i) => !removed.has(i));
+  }
+  const stillOpen: Pt[][] = [];
+  for (const p of paths) {
+    if (p.length >= 4 && key(p[0]) === key(p[p.length - 1])) loops.push(p.slice(0, -1));
+    else stillOpen.push(p);
+  }
+  return { loops, open: stillOpen };
 }

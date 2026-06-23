@@ -144,6 +144,88 @@ export function pointInPolygon(pt: Pt, exterior: Pt[], holes: Pt[][]): boolean {
   return true;
 }
 
+// ── Коллизии (вид сверху; координаты в одном кадре — [lng,lat] или [east,north]) ──
+
+function orient(a: Pt, b: Pt, c: Pt): number {
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+function onSeg(a: Pt, b: Pt, p: Pt): boolean {
+  return (
+    Math.min(a[0], b[0]) - 1e-12 <= p[0] && p[0] <= Math.max(a[0], b[0]) + 1e-12 &&
+    Math.min(a[1], b[1]) - 1e-12 <= p[1] && p[1] <= Math.max(a[1], b[1]) + 1e-12
+  );
+}
+/** Пересекаются ли отрезки p1p2 и p3p4 (включая касание). */
+export function segIntersect(p1: Pt, p2: Pt, p3: Pt, p4: Pt): boolean {
+  const d1 = orient(p3, p4, p1), d2 = orient(p3, p4, p2), d3 = orient(p1, p2, p3), d4 = orient(p1, p2, p4);
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+  if (d1 === 0 && onSeg(p3, p4, p1)) return true;
+  if (d2 === 0 && onSeg(p3, p4, p2)) return true;
+  if (d3 === 0 && onSeg(p1, p2, p3)) return true;
+  if (d4 === 0 && onSeg(p1, p2, p4)) return true;
+  return false;
+}
+/** Пересекаются ли контуры (любое ребро a с любым ребром b). */
+export function ringsCross(a: Pt[], b: Pt[]): boolean {
+  for (let i = 0; i < a.length; i++) {
+    const a1 = a[i], a2 = a[(i + 1) % a.length];
+    for (let j = 0; j < b.length; j++) {
+      if (segIntersect(a1, a2, b[j], b[(j + 1) % b.length])) return true;
+    }
+  }
+  return false;
+}
+/** Пересекаются ли наборы полигонов (ребро×ребро ИЛИ один внутри другого). */
+export function polysIntersect(A: PolyWithHoles[], B: PolyWithHoles[]): boolean {
+  for (const a of A)
+    for (const b of B) {
+      if (ringsCross(a.exterior, b.exterior)) return true;
+      if (b.exterior.length && pointInPolygon(b.exterior[0], a.exterior, a.holes)) return true;
+      if (a.exterior.length && pointInPolygon(a.exterior[0], b.exterior, b.holes)) return true;
+    }
+  return false;
+}
+/** Пересекаются ли две РАЗОМКНУТЫЕ ломаные (без замыкающего ребра). */
+export function polylinesIntersect(a: Pt[], b: Pt[]): boolean {
+  for (let i = 0; i + 1 < a.length; i++)
+    for (let j = 0; j + 1 < b.length; j++) if (segIntersect(a[i], a[i + 1], b[j], b[j + 1])) return true;
+  return false;
+}
+/** Касается ли ломаная line любого полигона A (ребро пересекает контур ИЛИ точка внутри). */
+export function lineHitsPolys(line: Pt[], A: PolyWithHoles[]): boolean {
+  for (const a of A) {
+    for (let i = 0; i + 1 < line.length; i++) {
+      const l1 = line[i], l2 = line[i + 1];
+      for (let j = 0; j < a.exterior.length; j++) {
+        if (segIntersect(l1, l2, a.exterior[j], a.exterior[(j + 1) % a.exterior.length])) return true;
+      }
+    }
+    for (const v of line) if (pointInPolygon(v, a.exterior, a.holes)) return true;
+  }
+  return false;
+}
+/** Выпуклая оболочка (Andrew monotone chain) — контур для точечных облаков. */
+export function convexHull(pts: Pt[]): Pt[] {
+  const ps = pts.filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1])).slice().sort((u, v) => u[0] - v[0] || u[1] - v[1]);
+  if (ps.length < 3) return ps;
+  const cr = (o: Pt, a: Pt, b: Pt) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower: Pt[] = [];
+  for (const p of ps) { while (lower.length >= 2 && cr(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); }
+  const upper: Pt[] = [];
+  for (let i = ps.length - 1; i >= 0; i--) { const p = ps[i]; while (upper.length >= 2 && cr(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+/** bbox набора колец [minX,minY,maxX,maxY]. */
+export function bboxOf(rings: Pt[][]): [number, number, number, number] {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const r of rings) for (const p of r) { if (p[0] < x0) x0 = p[0]; if (p[1] < y0) y0 = p[1]; if (p[0] > x1) x1 = p[0]; if (p[1] > y1) y1 = p[1]; }
+  return [x0, y0, x1, y1];
+}
+export function bboxOverlap(a: [number, number, number, number], b: [number, number, number, number]): boolean {
+  return a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3];
+}
+
 /**
  * Прогон GIS-01.
  * @param parcelPolys полигоны ЗУ в [east,north] (МСК-77) с дырками; могут быть из

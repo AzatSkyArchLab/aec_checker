@@ -1194,10 +1194,45 @@ body {
   white-space: nowrap;
   color: var(--text);
 }
+.gis-check-id {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
 .gis-check-badge {
   flex: none;
   font-weight: 700;
   font-size: 12px;
+}
+
+/* Строки результата внутри карточки проверки (модалка) */
+.gis-check-row {
+  border-top: 1px solid var(--border);
+  padding: 8px 0;
+}
+.gis-check-row:first-of-type {
+  border-top: none;
+}
+.gis-check-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.gis-check-row-subj {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+}
+.gis-check-row-detail {
+  margin: 4px 0 0 20px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
 }
 
 /* ── GIS-01: карточки отчёта (по каждой модели) ── */

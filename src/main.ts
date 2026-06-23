@@ -384,54 +384,73 @@ async function initGis(): Promise<GisView> {
     if (files.length) void view.openFiles(files);
   });
 
-  // ── Проверка GIS-01: вердикт по КАЖДОЙ модели ──────────────────────────────
+  // ── Проверки ГИС (GIS-01/02/04/06): по проверке → строки по субъектам ───────
   const gis01Modal = $<HTMLElement>("#gis01-modal");
   const gis01Verdict = $<HTMLElement>("#gis01-verdict");
   const gis01Cards = $<HTMLElement>("#gis01-cards");
+  const badgeText = (s: string): string =>
+    s === "pass" ? "✓ соответствие" : s === "warn" ? "⚠ внимание" : s === "fail" ? "✗ нарушение" : "— н/д";
   const runChecks = (): void => {
-    const out = view.runAllChecks();
-    if (!out) return; // статус-сообщение уже показано (нет модели/ЗУ)
-    const { perModel, counts } = out;
-    gis01Verdict.textContent = `моделей: ${perModel.length} · ✓ ${counts.pass} · ⚠ ${counts.warn} · ✗ ${counts.fail}`;
-    gis01Verdict.className = `map-method status-${counts.fail ? "fail" : counts.warn ? "warn" : "pass"}`;
+    const results = view.runChecks();
+    if (!results) return; // статус-сообщение уже показано (нет данных)
+    const f = results.filter((r) => r.status === "fail").length;
+    const w = results.filter((r) => r.status === "warn").length;
+    gis01Verdict.textContent = `проверок: ${results.length} · нарушений ${f} · внимание ${w}`;
+    gis01Verdict.className = `map-method status-${f ? "fail" : w ? "warn" : "pass"}`;
     gis01Cards.innerHTML = "";
-    for (const r of perModel) {
+    for (const chk of results) {
       const card = document.createElement("div");
       card.className = "gis01-card";
 
       const head = document.createElement("div");
       head.className = "gis01-card-head";
-      const dot = document.createElement("span");
-      dot.className = "gis01-dot";
-      dot.style.background = r.color;
       const nm = document.createElement("span");
       nm.className = "gis01-card-name";
-      nm.textContent = r.name;
+      nm.textContent = `${chk.id} · ${chk.name}`;
       const bd = document.createElement("span");
-      bd.className = `gis01-card-badge status-${r.status}`;
-      bd.textContent = r.status === "pass" ? "✓ соответствие" : r.status === "warn" ? "⚠ частично" : "✗ не соответствие";
-      head.append(dot, nm, bd);
+      bd.className = `gis01-card-badge status-${chk.status === "na" ? "warn" : chk.status}`;
+      bd.textContent = badgeText(chk.status);
+      head.append(nm, bd);
+      card.append(head);
 
-      const summary = document.createElement("div");
-      summary.className = "gis01-card-summary";
-      summary.textContent = r.summary;
-
-      const sketch = document.createElement("div");
-      sketch.className = "gis01-sketch";
-      sketch.innerHTML = r.svg;
-
-      const dl = document.createElement("button");
-      dl.className = "tool-btn gis01-card-dl";
-      dl.textContent = "⬇ Эскиз PNG";
-      dl.addEventListener("click", () => downloadSvgAsPng(r.svg, `GIS-01_${r.name.replace(/\.[^.]+$/, "")}.png`));
-
-      card.append(head, summary, sketch, dl);
+      for (const row of chk.rows) {
+        const r = document.createElement("div");
+        r.className = "gis-check-row";
+        const dot = document.createElement("span");
+        dot.className = "gis01-dot";
+        dot.style.background = row.color || "#888";
+        const subj = document.createElement("span");
+        subj.className = "gis-check-row-subj";
+        subj.textContent = row.subject;
+        const rb = document.createElement("span");
+        rb.className = `gis-check-badge status-${row.status === "na" ? "warn" : row.status}`;
+        rb.textContent = row.status === "pass" ? "✓" : row.status === "warn" ? "⚠" : row.status === "fail" ? "✗" : "—";
+        const det = document.createElement("div");
+        det.className = "gis-check-row-detail";
+        det.textContent = row.detail;
+        const rowHead = document.createElement("div");
+        rowHead.className = "gis-check-row-head";
+        rowHead.append(dot, subj, rb);
+        r.append(rowHead, det);
+        if (row.svg) {
+          const sketch = document.createElement("div");
+          sketch.className = "gis01-sketch";
+          sketch.innerHTML = row.svg;
+          const dl = document.createElement("button");
+          dl.className = "tool-btn gis01-card-dl";
+          dl.textContent = "⬇ Эскиз PNG";
+          const svg = row.svg;
+          dl.addEventListener("click", () => downloadSvgAsPng(svg, `${chk.id}_${row.subject.replace(/\.[^.]+$/, "")}.png`));
+          r.append(sketch, dl);
+        }
+        card.append(r);
+      }
       gis01Cards.appendChild(card);
     }
     gis01Modal.hidden = false;
   };
   $("#gis01-run").addEventListener("click", runChecks);
-  view.setChecksViewer(runChecks); // кнопка «GIS-01» в левой панели открывает тот же отчёт
+  view.setChecksViewer(runChecks); // кнопка в левой панели открывает тот же отчёт
   $("#gis01-close").addEventListener("click", () => (gis01Modal.hidden = true));
   gis01Modal.addEventListener("click", (e) => {
     if (e.target === gis01Modal) gis01Modal.hidden = true;
