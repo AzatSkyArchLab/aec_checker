@@ -3,7 +3,7 @@ import maplibregl from "maplibre-gl";
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import type { GpzuPoint } from "./gpzu.ts";
-import { classifyRings, runGis01 as runGis01Calc, sketchSvg, polysIntersect, lineHitsPolys, polylinesIntersect, convexHull, bboxOf, bboxOverlap } from "./gis01.ts";
+import { classifyRings, runGis01 as runGis01Calc, sketchSvg, polysIntersect, lineHitsPolys, polylinesIntersect, convexHull, concaveFootprint, bboxOf, bboxOverlap } from "./gis01.ts";
 import type { FbxGeom, PolyWithHoles } from "./gis01.ts";
 
 /**
@@ -45,6 +45,45 @@ const GIS_LAYER_TYPES: Record<GisLayerKind, GisLayerType> = {
 };
 const GIS_LAYER_KINDS = Object.keys(GIS_LAYER_TYPES) as GisLayerKind[];
 
+/** Конкатенация строковых значений properties выборки фич (для детекта по содержимому). */
+function samplePropsText(features?: unknown[]): string {
+  if (!features?.length) return "";
+  let s = "";
+  for (let i = 0; i < Math.min(features.length, 50); i++) {
+    const p = (features[i] as { properties?: Record<string, unknown> } | null)?.properties;
+    if (!p) continue;
+    for (const v of Object.values(p)) if (typeof v === "string") s += " " + v;
+  }
+  return s.toLowerCase();
+}
+/** Преобладают ли среди фич линии (LineString/MultiLineString)? */
+function mostlyLines(features?: unknown[]): boolean {
+  if (!features?.length) return false;
+  let lines = 0, polys = 0;
+  for (let i = 0; i < Math.min(features.length, 200); i++) {
+    const t = (features[i] as { geometry?: { type?: string } } | null)?.geometry?.type;
+    if (t === "LineString" || t === "MultiLineString") lines++;
+    else if (t === "Polygon" || t === "MultiPolygon") polys++;
+  }
+  return lines > polys;
+}
+/**
+ * Автоопределение типа ГИС-слоя по имени файла (регистронезависимо), а при наличии —
+ * по строковым полям properties фич. Фолбэк по геометрии: преимущественно линии →
+ * redlines; иначе redlines как дефолт (переопределяемо в UI селектором типа).
+ */
+function detectGisKind(fileName: string, features?: unknown[]): GisLayerKind {
+  const byText = (s: string): GisLayerKind | null => {
+    const okn = /окн|okn/.test(s);
+    if (/красн|red[ _-]?lin|redline/.test(s)) return "redlines";
+    if (okn && /объект/.test(s)) return "okn-object";
+    if (okn || /памятник|охранн|достоприм/.test(s)) return "okn-territory";
+    if (/кадастр|cadastr|квартал/.test(s)) return "cadastral";
+    return null;
+  };
+  return byText(fileName.toLowerCase()) ?? byText(samplePropsText(features)) ?? (mostlyLines(features) ? "redlines" : "redlines");
+}
+
 /** Геопривязка модели (для диагностики «объект вне ЗУ» в GIS-01). */
 type ModelGeo =
   | { source: "fbx" }
@@ -61,7 +100,11 @@ interface PlacedModel {
   center: Pt; // центр модели [hA,hB] (для маркера и оси доворота)
   color: string;
   info: string; // краткая строка для панели
+  footArea: number; // площадь наибольшего кольца контура основания, м² (для детекта рельефа)
 }
+
+// Рельеф/подоснова по имени файла — НЕ проверяется как здание (GIS-01/02, ОКН-строка GIS-06).
+const TERRAIN_NAME_RE = /ground|рельеф|terrain|подоснов/i;
 
 /** Граница ЗУ (из ГПЗУ или DWG). Несколько сосуществуют; GIS-01 берёт объединение. */
 interface Boundary {
@@ -289,7 +332,7 @@ export class GisView {
     else if (name.endsWith(".ifc")) await this.addIfc(file);
     else if (name.endsWith(".dwg")) await this.addDwg(file);
     else if (name.endsWith(".pdf")) await this.addGpzu(file);
-    else if (name.endsWith(".geojson") || name.endsWith(".json")) await this.addGisLayer(file, "redlines");
+    else if (name.endsWith(".geojson") || name.endsWith(".json")) await this.addGisLayer(file, detectGisKind(file.name), true);
     else throw new Error("неподдерживаемый тип файла");
   }
 
@@ -358,9 +401,34 @@ export class GisView {
     // ось1=высота, ось0=East, ось2=−North (Y-up). center в горизонт. осях [hA=0, hB=2].
     const vAxis = 1, hA = 0, hB = 2;
     const center: Pt = [(min[hA] + max[hA]) / 2, (min[hB] + max[hB]) / 2];
-    const footprint = sliceFootprint(meshes, vAxis, hA, hB, min[vAxis] + 0.01);
+    const baseV = min[vAxis];
+    const topV = max[vAxis];
+    let footprint = sliceFootprint(meshes, vAxis, hA, hB, baseV + 0.01);
+    // Меш: основание модели (min по высоте) часто задаёт мелкий низкий элемент
+    // (ступень/цоколь/стилобат/опоры), а у самого низа срез почти пуст или ловит
+    // лишь внутреннюю мелочь. Сканируем по высоте и берём срез, чей наибольший
+    // контур максимален по площади (реальный габарит здания — повёрнутый
+    // прямоугольник по стенам), при близких площадях — самый «чистый» (меньше
+    // колец/обрывков). Для облаков точек footprint остаётся базовым.
+    if (tris > 0) {
+      const span = topV - baseV;
+      const step = Math.max(span / 32, 0.25);
+      const maxRingArea = (fp: Footprint) => fp.rings.reduce((m, r) => Math.max(m, ringAreaAbs(r)), 0);
+      const clutter = (fp: Footprint) => fp.rings.length + fp.lines.length;
+      let best = footprint;
+      for (let h = baseV + step; h < topV - step * 0.5; h += step) {
+        const fp = sliceFootprint(meshes, vAxis, hA, hB, h);
+        if (fp.rings.length === 0) continue;
+        const a = maxRingArea(fp);
+        const ba = maxRingArea(best);
+        if (a > ba * 1.02 || (a >= ba * 0.9 && clutter(fp) < clutter(best))) best = fp;
+      }
+      footprint = best;
+    }
     const geom: FbxGeom = { meshes, min, max, vAxis, hA, hB, isCloud: tris === 0 };
-    const nPts = footprint.points.length || footprint.rings.reduce((s, r) => s + r.length, 0);
+    const ringPts = footprint.rings.reduce((s, r) => s + r.length, 0);
+    const nPts = ringPts || footprint.points.length;
+    const footArea = footprint.rings.reduce((m, r) => Math.max(m, ringAreaAbs(r)), 0);
     this.models.push({
       id: `m${++this.seq}`,
       name,
@@ -369,8 +437,9 @@ export class GisView {
       geo,
       footprint,
       center,
+      footArea,
       color: MODEL_PALETTE[this.models.length % MODEL_PALETTE.length],
-      info: `${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "точки"} · срез: ${nPts} тчк`,
+      info: `${(verts / 1000).toFixed(0)}k вершин · ${tris ? "меш" : "облако→контур"} · контур: ${nPts} тчк`,
     });
   }
 
@@ -422,7 +491,7 @@ export class GisView {
   }
 
   /** GeoJSON выбранного типа → тематический ГИС-слой (client-side) + перерисовка слоя. */
-  private async addGisLayer(file: File, kind: GisLayerKind): Promise<void> {
+  private async addGisLayer(file: File, kind: GisLayerKind, auto = false): Promise<void> {
     const gj = JSON.parse(await file.text());
     const fc =
       gj?.type === "FeatureCollection"
@@ -430,8 +499,12 @@ export class GisView {
         : { type: "FeatureCollection", features: gj?.type === "Feature" ? [gj] : [] };
     const features: unknown[] = Array.isArray(fc.features) ? fc.features : [];
     if (features.length === 0) throw new Error("нет объектов (ожидался GeoJSON FeatureCollection)");
-    this.gisLayers.push({ id: `g${++this.seq}`, name: file.name, kind, n: features.length, features, visible: true });
-    this.rebuildLayer(kind);
+    // Автодетект (общий загрузчик): уточняем тип по содержимому фич — имя файла уже
+    // учтено в kind, теперь добиваем по properties/геометрии. Явно заданный тип
+    // (ручной загрузчик, auto=false) не трогаем.
+    const finalKind = auto ? detectGisKind(file.name, features) : kind;
+    this.gisLayers.push({ id: `g${++this.seq}`, name: file.name, kind: finalKind, n: features.length, features, visible: true });
+    this.rebuildLayer(finalKind);
   }
 
   /** Пересобирает источник одного типа ГИС-слоёв из всех видимых наборов (с учётом датума). */
@@ -483,6 +556,18 @@ export class GisView {
     if (!l) return;
     l.visible = visible;
     this.rebuildLayer(l.kind);
+  }
+
+  /** Ручной override типа слоя: переносим набор со старого источника на новый. */
+  private changeGisLayerKind(id: string, kind: GisLayerKind): void {
+    const l = this.gisLayers.find((x) => x.id === id);
+    if (!l || l.kind === kind) return;
+    const old = l.kind;
+    l.kind = kind;
+    this.rebuildLayer(old); // убрать с прежнего источника карты
+    this.rebuildLayer(kind); // дорисовать на новом
+    this.renderPanel();
+    this.setStatus(`Тип слоя «${l.name}» → ${GIS_LAYER_TYPES[kind].label}`);
   }
 
   /** Авто-детект оси DWG→МСК-77: пробуем обе ориентации, берём попадание в Москву. */
@@ -553,8 +638,8 @@ export class GisView {
           coords.forEach(ext);
         }
       }
-      // Точечное облако: контура-меша нет → рисуем полигон выпуклой оболочки среза.
-      if (m.geom.isCloud && m.footprint.points.length >= 3) {
+      // Облако без контура (fallback): если вогнутая оболочка не построилась — выпуклая.
+      if (m.geom.isCloud && m.footprint.rings.length === 0 && m.footprint.points.length >= 3) {
         const hull = convexHull(m.footprint.points);
         const coords = hull.map((p) => this.ll(p)).filter((c) => Math.abs(c[1]) <= 90);
         if (coords.length >= 3) {
@@ -562,13 +647,15 @@ export class GisView {
           coords.forEach(ext);
         }
       }
-      for (const p of m.footprint.points) {
-        const c = this.ll(p);
-        if (Math.abs(c[1]) <= 90) {
-          features.push({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: { k: "pt", color } });
-          ext(c);
+      // Точки среза рисуем только когда точного контура нет (иначе он — главный).
+      if (!(m.geom.isCloud && m.footprint.rings.length > 0))
+        for (const p of m.footprint.points) {
+          const c = this.ll(p);
+          if (Math.abs(c[1]) <= 90) {
+            features.push({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: { k: "pt", color } });
+            ext(c);
+          }
         }
-      }
     }
     (map.getSource("footprint") as maplibregl.GeoJSONSource).setData({ type: "FeatureCollection", features } as any);
 
@@ -699,6 +786,23 @@ export class GisView {
   private parcelPolysEN(): PolyWithHoles[] {
     return this.boundaries.flatMap((b) => classifyRings(b.rings.map((r) => r.map((p) => [p.Y, p.X] as Pt))));
   }
+  /** Площадь наибольшего участка ЗУ, м² (для эвристики «модель шире участка»). */
+  private parcelArea(): number {
+    let a = 0;
+    for (const pl of this.parcelPolysEN()) a = Math.max(a, ringAreaAbs(pl.exterior));
+    return a;
+  }
+  /**
+   * Модель — рельеф/подоснова (а не здание)? По имени файла
+   * (ground/рельеф/terrain/подоснова) ИЛИ эвристика: контур модели в разы шире
+   * участка (площадь > 3× площади ЗУ). Такие модели исключаются из проверок
+   * здания GIS-01/02 и из строки «здание × ОКН» в GIS-06.
+   */
+  private isTerrain(m: PlacedModel): boolean {
+    if (TERRAIN_NAME_RE.test(m.name)) return true;
+    const pa = this.parcelArea();
+    return pa > 0 && m.footArea > pa * 3;
+  }
   /** Граница ЗУ → полигоны в WGS84 (без калибровки — авторитетный эталон). */
   private boundaryPolysWgs(b: Boundary): PolyWithHoles[] {
     return classifyRings(b.rings.map((r) => r.map((p) => this.toWgs84(p.Y, p.X))));
@@ -713,8 +817,12 @@ export class GisView {
     const ringsModel: Pt[][] = [];
     const linesModel: Pt[][] = [];
     if (g.isCloud) {
-      const hull = convexHull(m.footprint.points);
-      if (hull.length >= 3) ringsModel.push(hull);
+      // Точный контур (вогнутая оболочка) — не выпуклый блоб; иначе fallback на convex.
+      for (const r of m.footprint.rings) if (r.length >= 3) ringsModel.push(r);
+      if (ringsModel.length === 0 && m.footprint.points.length >= 3) {
+        const hull = convexHull(m.footprint.points);
+        if (hull.length >= 3) ringsModel.push(hull);
+      }
     } else {
       const base = g.min[g.vAxis], top = g.max[g.vAxis];
       const step = Math.max((top - base) / 8, 1.5);
@@ -788,7 +896,8 @@ export class GisView {
     else {
       const polys = this.parcelPolysEN();
       for (const m of this.models) {
-        const res = runGis01Calc(m.geom, polys, (p) => this.toMskCal(p));
+        if (this.isTerrain(m)) { rows.push({ subject: m.name, color: m.color, status: "na", detail: "рельеф/подоснова — не проверяется как здание" }); continue; }
+        const res = runGis01Calc(m.geom, polys, (p) => this.toMskCal(p), m.footprint.rings);
         const diag = res.noOverlap ? this.geoDiagnostic(m.geo) : "";
         const svg = sketchSvg(res, { diagnostic: diag, file: `${m.name} (${m.kind.toUpperCase()})` });
         rows.push({ subject: m.name, color: m.color, status: res.status, detail: res.summary, svg });
@@ -800,10 +909,11 @@ export class GisView {
   /** GIS-02: срез здания не должен пересекать красные линии (отступ соблюдён). */
   private checkGis02(): CheckResult {
     const rows: CheckRow[] = [];
+    const buildings = this.models.filter((m) => !this.isTerrain(m));
     if (!this.hasVisibleLayer("redlines")) rows.push({ subject: "—", status: "na", detail: "нет данных по красным линиям (загрузите ГИС-слой)" });
-    else if (this.models.length === 0) rows.push({ subject: "—", status: "na", detail: "нет модели (FBX/IFC)" });
+    else if (buildings.length === 0) rows.push({ subject: "—", status: "na", detail: "нет модели-здания (FBX/IFC)" });
     else {
-      const geoms = this.models.map((m) => ({ m, ...this.modelFootprintGeomWgs(m) }));
+      const geoms = buildings.map((m) => ({ m, ...this.modelFootprintGeomWgs(m) }));
       // Единый clip-bbox по всем моделям (+~1 км) — фильтруем красные линии один раз.
       const clip = expandBox(unionBox(geoms.map((x) => x.bbox)), 0.012);
       const redLines = this.overlayLinesWgsClipped("redlines", clip);
@@ -821,6 +931,8 @@ export class GisView {
             : "пересечений с красными линиями нет — отступ соблюдён (с исключениями)") + note,
         });
       }
+      for (const m of this.models.filter((x) => this.isTerrain(x)))
+        rows.push({ subject: m.name, color: m.color, status: "na", detail: "рельеф/подоснова — не проверяется как здание" });
     }
     return { id: "GIS-02", name: "Отступ от красных линий", rows, status: worstStatus(rows) };
   }
@@ -854,28 +966,50 @@ export class GisView {
     return { id: "GIS-04", name: "Координаты в GeoJSON/IFC в МСК-77", rows, status: worstStatus(rows) };
   }
 
-  /** GIS-06: участок (ЗУ) не пересекается с зоной охраны/объектом ОКН. */
+  /**
+   * GIS-06: пересечение с территорией/зоной/объектом ОКН — двумя субъектами.
+   * ГЛАВНАЯ строка — контур ЗДАНИЯ (точный срез основания) × ОКН (рельеф
+   * исключаем), затем участок ЗУ × ОКН.
+   */
   private checkGis06(): CheckResult {
     const rows: CheckRow[] = [];
     const hasOkn = this.hasVisibleLayer("okn-territory") || this.hasVisibleLayer("okn-object");
+    const buildings = this.models.filter((m) => !this.isTerrain(m));
     if (!hasOkn) rows.push({ subject: "—", status: "na", detail: "нет полигонов ОКН (загрузите территории/объекты ОКН)" });
-    else if (this.boundaries.length === 0) rows.push({ subject: "—", status: "na", detail: "нет границы ЗУ" });
+    else if (this.boundaries.length === 0 && buildings.length === 0) rows.push({ subject: "—", status: "na", detail: "нет границы ЗУ и модели-здания" });
     else {
       const okn = [...this.overlayPolysWgs("okn-territory"), ...this.overlayPolysWgs("okn-object")];
       const note = this.overlaysDatum === "wgs84" ? " · датум слоёв: WGS84 (если ОКН уехали — переключите на Пулково)" : "";
+      // 1) ГЛАВНАЯ строка — контур здания (срез) × ОКН; рельеф исключаем.
+      for (const m of buildings) {
+        const { polys } = this.modelFootprintGeomWgs(m);
+        if (polys.length === 0) { rows.push({ subject: `здание: ${m.name}`, color: m.color, status: "na", detail: "не удалось построить контур здания" }); continue; }
+        const hit = polysIntersect(polys, okn);
+        rows.push({
+          subject: `здание: ${m.name}`,
+          color: m.color,
+          status: hit ? "fail" : "pass",
+          detail: (hit
+            ? "контур здания ПЕРЕСЕКАЕТ территорию/зону ОКН — нужны обмеры или исключение"
+            : "контур здания не пересекает ОКН") + note,
+        });
+      }
+      for (const m of this.models.filter((x) => this.isTerrain(x)))
+        rows.push({ subject: `здание: ${m.name}`, color: m.color, status: "na", detail: "рельеф/подоснова — не проверяется как здание" });
+      // 2) участок ЗУ × ОКН — как было.
       for (const b of this.boundaries) {
         const zu = this.boundaryPolysWgs(b);
         const hit = polysIntersect(zu, okn);
         rows.push({
-          subject: b.name,
+          subject: `участок: ${b.name}`,
           status: hit ? "fail" : "pass",
           detail: (hit
             ? "участок ПЕРЕСЕКАЕТ зону охраны/объект ОКН — нужны обмеры или исключение"
-            : "пересечений с ОКН нет") + note,
+            : "участок не пересекает ОКН") + note,
         });
       }
     }
-    return { id: "GIS-06", name: "Пересечение ЗУ с зоной охраны ОКН", rows, status: worstStatus(rows) };
+    return { id: "GIS-06", name: "Пересечение с территорией/зоной ОКН", rows, status: worstStatus(rows) };
   }
 
   /** Первая координата [lng,lat] (как в файле) первого объекта слоя. */
@@ -936,8 +1070,10 @@ export class GisView {
     const canCheck = hasModels || this.boundaries.length > 0 || this.gisLayers.length > 0;
 
     const items: string[] = [];
-    for (const m of this.models)
-      items.push(this.itemRow(m.id, m.kind.toUpperCase(), m.name, m.info, "gis-badge-model", m.color));
+    for (const m of this.models) {
+      const info = this.isTerrain(m) ? `${m.info} · рельеф/подоснова (не как здание)` : m.info;
+      items.push(this.itemRow(m.id, m.kind.toUpperCase(), m.name, info, "gis-badge-model", m.color));
+    }
     for (const b of this.boundaries)
       items.push(this.itemRow(b.id, b.kind === "dwg" ? "DWG" : "ГПЗУ", b.name, b.info, b.ok ? "gis-badge-zu" : "gis-badge-warn"));
     const itemsHtml = items.length
@@ -994,6 +1130,9 @@ export class GisView {
     this.infoEl.querySelectorAll<HTMLInputElement>("[data-vis]").forEach((cb) =>
       cb.addEventListener("change", () => this.toggleGisLayer(cb.dataset.vis!, cb.checked)),
     );
+    this.infoEl.querySelectorAll<HTMLSelectElement>("[data-kind]").forEach((sel) =>
+      sel.addEventListener("change", () => this.changeGisLayerKind(sel.dataset.kind!, sel.value as GisLayerKind)),
+    );
     this.infoEl.querySelector<HTMLButtonElement>("#gis-run-checks")?.addEventListener("click", () => this.onShowChecks?.());
     this.infoEl.querySelector<HTMLSelectElement>("#gis-overlays-datum")?.addEventListener("change", (e) =>
       void this.setOverlaysDatum((e.target as HTMLSelectElement).value as "wgs84" | "pulkovo"),
@@ -1017,9 +1156,14 @@ export class GisView {
 
   private gisLayerRow(l: GisLayer): string {
     const cfg = GIS_LAYER_TYPES[l.kind];
+    // Селектор типа — ручной override автодетекта (если распознало неверно).
+    const opts = GIS_LAYER_KINDS
+      .map((k) => `<option value="${k}"${k === l.kind ? " selected" : ""}>${esc(GIS_LAYER_TYPES[k].label)}</option>`)
+      .join("");
     return `<div class="gis-item">
       <input class="gis-vis" type="checkbox" data-vis="${l.id}"${l.visible ? " checked" : ""} title="видимость" />
       <span class="gis-swatch" style="background:${cfg.color}"></span>
+      <select class="gis-kind-sel" data-kind="${l.id}" title="тип слоя (поправьте, если автодетект ошибся)">${opts}</select>
       <span class="gis-item-name" title="${esc(l.name)}">${esc(cfg.label)}: ${esc(l.name)}</span>
       <span class="gis-item-info">${l.n} об.</span>
       <button class="gis-item-del" data-del="${l.id}" title="убрать">✕</button>
@@ -1248,6 +1392,8 @@ export class GisView {
     for (const kind of GIS_LAYER_KINDS) {
       const cfg = GIS_LAYER_TYPES[kind];
       map.addSource(cfg.src, { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+      // Заливка только для полигональных слоёв (ОКН/кадастр-полигоны); для красных линий
+      // (LineString) заливка бессмысленна и фильтром отсекается.
       map.addLayer({
         id: cfg.fill,
         type: "fill",
@@ -1255,11 +1401,19 @@ export class GisView {
         filter: ["==", ["geometry-type"], "Polygon"],
         paint: { "fill-color": cfg.color, "fill-opacity": 0.12 },
       });
+      // Красные линии — это LineString: рисуем их именно линиями, заметно и с зум-откликом.
+      const lineWidth =
+        kind === "redlines"
+          ? (["interpolate", ["linear"], ["zoom"], 9, 1.6, 13, 3, 16, 4.5] as any)
+          : kind === "cadastral"
+            ? 0.9
+            : 1.6;
       map.addLayer({
         id: cfg.line,
         type: "line",
         source: cfg.src,
-        paint: { "line-color": cfg.color, "line-width": 1.6, "line-opacity": 0.92 },
+        layout: { "line-cap": "round", "line-join": "round", visibility: "visible" },
+        paint: { "line-color": cfg.color, "line-width": lineWidth, "line-opacity": kind === "redlines" ? 1 : 0.92 },
       });
     }
     // Участок из ГПЗУ — авторитетный эталон (МСК-77), ярко-зелёным.
@@ -1378,6 +1532,7 @@ interface Footprint {
 interface WorldMesh {
   world: Float32Array;
   index: ArrayLike<number> | null;
+  cloud: boolean; // true — реальное облако точек (THREE.Points); false — поверхность (грани)
 }
 
 function collectWorld(group: THREE.Object3D): {
@@ -1394,7 +1549,13 @@ function collectWorld(group: THREE.Object3D): {
   let tris = 0;
   const v = new THREE.Vector3();
   group.traverse((o: any) => {
-    if (!o.isMesh || !o.geometry?.attributes?.position) return;
+    // Поверхность (THREE.Mesh) и облако точек (THREE.Points) — разные сущности.
+    // Mesh — грани/треугольники (индексированные ИЛИ последовательные тройки),
+    // Points — реальное облако без граней. FBXLoader часто отдаёт меш
+    // НЕиндексированным (index=null) — это по-прежнему треугольники, не облако.
+    const isMeshObj = !!o.isMesh;
+    const isPointsObj = !!o.isPoints && !isMeshObj;
+    if ((!isMeshObj && !isPointsObj) || !o.geometry?.attributes?.position) return;
     const pos = o.geometry.attributes.position;
     const n = pos.count;
     const world = new Float32Array(n * 3);
@@ -1412,8 +1573,10 @@ function collectWorld(group: THREE.Object3D): {
     }
     verts += n;
     const idx = o.geometry.index ? o.geometry.index.array : null;
-    if (idx) tris += idx.length / 3;
-    meshes.push({ world, index: idx });
+    // Треугольники: индексированный меш — index.length/3; неиндексированный —
+    // position.count/3 (вершины идут тройками подряд). Облако точек — без граней.
+    if (isMeshObj) tris += idx ? idx.length / 3 : Math.floor(n / 3);
+    meshes.push({ world, index: idx, cloud: isPointsObj });
   });
   return { meshes, min, max, verts, tris };
 }
@@ -1434,7 +1597,7 @@ function ifcMeshesToWorld(ms: { positions: Float32Array; indices: ArrayLike<numb
   for (const m of ms) {
     const p = m.positions;
     if (!p || p.length === 0) continue;
-    meshes.push({ world: p, index: m.indices });
+    meshes.push({ world: p, index: m.indices, cloud: false });
     verts += p.length / 3;
     tris += m.indices.length / 3;
     for (let i = 0; i < p.length; i += 3) {
@@ -1449,6 +1612,12 @@ function ifcMeshesToWorld(ms: { positions: Float32Array; indices: ArrayLike<numb
   return { meshes, min, max, verts, tris };
 }
 
+function ringAreaAbs(r: Pt[]): number {
+  let a = 0;
+  for (let i = 0, j = r.length - 1; i < r.length; j = i++) a += (r[j][0] + r[i][0]) * (r[j][1] - r[i][1]);
+  return Math.abs(a / 2);
+}
+
 function sliceFootprint(
   meshes: WorldMesh[],
   vAxis: number,
@@ -1460,41 +1629,55 @@ function sliceFootprint(
   const lines: Pt[][] = [];
   const points: Pt[] = [];
   let anyTris = false;
+  const clouds: WorldMesh[] = [];
 
   for (const m of meshes) {
-    const p = m.world;
-    if (m.index && m.index.length >= 3) {
-      anyTris = true;
-      const segs: [Pt, Pt][] = [];
-      for (let t = 0; t + 2 < m.index.length; t += 3) {
-        const a = m.index[t] * 3;
-        const b = m.index[t + 1] * 3;
-        const c = m.index[t + 2] * 3;
-        const pts: Pt[] = [];
-        cross(p, a, b, vAxis, hA, hB, sliceV, pts);
-        cross(p, b, c, vAxis, hA, hB, sliceV, pts);
-        cross(p, c, a, vAxis, hA, hB, sliceV, pts);
-        if (pts.length === 2) segs.push([pts[0], pts[1]]);
-      }
-      const { loops, open } = stitch(segs);
-      rings.push(...loops);
-      lines.push(...open);
+    if (m.cloud) {
+      clouds.push(m);
+      continue;
     }
+    // Поверхность: режем треугольники плоскостью среза. Индексированный путь —
+    // по index, неиндексированный — вершины тройками подряд (a=3t,b=3(t+1),c=3(t+2)).
+    const p = m.world;
+    const idx = m.index;
+    const indexed = !!idx && idx.length >= 3;
+    const triCount = indexed ? Math.floor(idx!.length / 3) : Math.floor(p.length / 9);
+    if (triCount <= 0) continue;
+    anyTris = true;
+    const segs: [Pt, Pt][] = [];
+    for (let t = 0; t < triCount; t++) {
+      const a = indexed ? idx![t * 3] * 3 : t * 9;
+      const b = indexed ? idx![t * 3 + 1] * 3 : t * 9 + 3;
+      const c = indexed ? idx![t * 3 + 2] * 3 : t * 9 + 6;
+      const pts: Pt[] = [];
+      cross(p, a, b, vAxis, hA, hB, sliceV, pts);
+      cross(p, b, c, vAxis, hA, hB, sliceV, pts);
+      cross(p, c, a, vAxis, hA, hB, sliceV, pts);
+      if (pts.length === 2) segs.push([pts[0], pts[1]]);
+    }
+    const { loops, open } = stitch(segs);
+    rings.push(...loops);
+    lines.push(...open);
   }
 
-  if (!anyTris) {
+  // Вогнутая оболочка — ТОЛЬКО fallback для настоящих облаков точек (THREE.Points),
+  // когда поверхностей с гранями нет вовсе.
+  if (!anyTris && clouds.length) {
     let minV = Infinity;
     let maxV = -Infinity;
-    for (const m of meshes)
+    for (const m of clouds)
       for (let i = vAxis; i < m.world.length; i += 3) {
         if (m.world[i] < minV) minV = m.world[i];
         if (m.world[i] > maxV) maxV = m.world[i];
       }
     const band = Math.max((maxV - minV) * 0.02, 0.5);
-    for (const m of meshes)
+    for (const m of clouds)
       for (let i = 0; i < m.world.length; i += 3) {
         if (m.world[i + vAxis] <= minV + band) points.push([m.world[i + hA], m.world[i + hB]]);
       }
+    // Облако без триангуляции: точный контур основания — вогнутая оболочка (НЕ convex hull),
+    // сохраняет вогнутости/дворы/Г-образные планы и разрывы (несколько корпусов).
+    rings.push(...concaveFootprint(points));
   }
   return { rings, lines, points };
 }

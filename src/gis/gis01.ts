@@ -12,7 +12,7 @@
 export type Pt = [number, number];
 
 export interface FbxGeom {
-  meshes: { world: Float32Array; index: ArrayLike<number> | null }[];
+  meshes: { world: Float32Array; index: ArrayLike<number> | null; cloud: boolean }[];
   min: number[];
   max: number[];
   vAxis: number;
@@ -42,6 +42,8 @@ export interface Gis01Result {
   noOverlap: boolean; // объект НИ ОДНОЙ точкой не попал в ЗУ (проблема координат)
   offsetM: number; // расстояние центр объекта ↔ центр ЗУ, м
   buildingCentroidEN: Pt | null;
+  contourEN: Pt[][]; // точный контур основания (МСК-77): меш→сшитые кольца, облако→вогнутая оболочка
+  contourOutsideEN: Pt[]; // вершины контура вне ЗУ (для эскиза)
 }
 
 const STEP = 1.5; // шаг срезов, м
@@ -49,26 +51,29 @@ const CLOUD_BAND = 0.75; // полуширина полосы для облак�
 
 /** Горизонтальные координаты точек среза здания на высоте h (в осях hA/hB FBX). */
 function slicePts(geom: FbxGeom, h: number): Pt[] {
-  const { meshes, vAxis, hA, hB, isCloud } = geom;
+  const { meshes, vAxis, hA, hB } = geom;
   const out: Pt[] = [];
-  if (!isCloud) {
-    for (const m of meshes) {
-      const p = m.world;
-      const idx = m.index;
-      if (!idx || idx.length < 3) continue;
-      for (let t = 0; t + 2 < idx.length; t += 3) {
-        const a = idx[t] * 3, b = idx[t + 1] * 3, c = idx[t + 2] * 3;
-        crossEdge(p, a, b, vAxis, hA, hB, h, out);
-        crossEdge(p, b, c, vAxis, hA, hB, h, out);
-        crossEdge(p, c, a, vAxis, hA, hB, h, out);
-      }
-    }
-  } else {
-    for (const m of meshes) {
-      const p = m.world;
+  for (const m of meshes) {
+    const p = m.world;
+    if (m.cloud) {
+      // Реальное облако точек — берём точки в полосе вокруг высоты среза.
       for (let i = 0; i < p.length; i += 3) {
         if (Math.abs(p[i + vAxis] - h) <= CLOUD_BAND) out.push([p[i + hA], p[i + hB]]);
       }
+      continue;
+    }
+    // Поверхность: пересечение рёбер треугольников плоскостью среза. Индексированный
+    // путь — по index; неиндексированный — вершины тройками подряд (a=3t,…).
+    const idx = m.index;
+    const indexed = !!idx && idx.length >= 3;
+    const triCount = indexed ? Math.floor(idx!.length / 3) : Math.floor(p.length / 9);
+    for (let t = 0; t < triCount; t++) {
+      const a = indexed ? idx![t * 3] * 3 : t * 9;
+      const b = indexed ? idx![t * 3 + 1] * 3 : t * 9 + 3;
+      const c = indexed ? idx![t * 3 + 2] * 3 : t * 9 + 6;
+      crossEdge(p, a, b, vAxis, hA, hB, h, out);
+      crossEdge(p, b, c, vAxis, hA, hB, h, out);
+      crossEdge(p, c, a, vAxis, hA, hB, h, out);
     }
   }
   return out;
@@ -216,6 +221,114 @@ export function convexHull(pts: Pt[]): Pt[] {
   lower.pop(); upper.pop();
   return lower.concat(upper);
 }
+/**
+ * Точный контур нижнего среза ОБЛАКА точек (FBX без индексов) — alpha-shape на
+ * регулярной сетке. В отличие от convexHull сохраняет вогнутости, дворы, Г-образные
+ * планы и разрывы (несколько корпусов → несколько колец):
+ *   1) точки → занятые ячейки сетки (адаптивный размер);
+ *   2) морфологическое закрытие (дилатация+эрозия) — шов стен с редкими точками;
+ *   3) заливка внутренних пустот (flood-fill извне) — комнаты не считаем дворами;
+ *   4) граничные рёбра «занято|свободно» → сшивка в замкнутые кольца → упрощение.
+ */
+export function concaveFootprint(pointsRaw: Pt[]): Pt[][] {
+  const pts = pointsRaw.filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+  if (pts.length < 8) { const h = convexHull(pts); return h.length >= 3 ? [h] : []; }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of pts) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  const w = Math.max(maxX - minX, 1e-6), hgt = Math.max(maxY - minY, 1e-6);
+  const span = Math.max(w, hgt);
+  // размер ячейки по плотности точек, но в разумных пределах относительно габарита.
+  const cell = Math.min(span / 12, Math.max(span / 150, 1.8 * Math.sqrt((w * hgt) / pts.length)));
+  const GW = Math.ceil(w / cell) + 2, GH = Math.ceil(hgt / cell) + 2; // +рамка пустых ячеек
+  const k = (cx: number, cy: number) => cy * GW + cx;
+  const occ = new Set<number>();
+  for (const [x, y] of pts) {
+    const cx = Math.min(GW - 1, Math.max(0, Math.floor((x - minX) / cell) + 1));
+    const cy = Math.min(GH - 1, Math.max(0, Math.floor((y - minY) / cell) + 1));
+    occ.add(k(cx, cy));
+  }
+  const inG = (cx: number, cy: number) => cx >= 0 && cx < GW && cy >= 0 && cy < GH;
+  // закрытие: дилатация (8-связность) → эрозия — заклеивает 1-клеточные разрывы.
+  const dil = new Set<number>(occ);
+  for (const c of occ) { const cx = c % GW, cy = (c - cx) / GW;
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) if (inG(cx + dx, cy + dy)) dil.add(k(cx + dx, cy + dy)); }
+  const closed = new Set<number>();
+  for (const c of dil) { const cx = c % GW, cy = (c - cx) / GW; let all = true;
+    for (let dx = -1; dx <= 1 && all; dx++) for (let dy = -1; dy <= 1; dy++) if (!inG(cx + dx, cy + dy) || !dil.has(k(cx + dx, cy + dy))) { all = false; break; }
+    if (all) closed.add(c); }
+  const solid0 = closed.size >= occ.size * 0.4 ? closed : occ; // эрозия не должна «съесть» тонкую полосу
+  // заливка внутренних пустот: пустые ячейки, НЕ достижимые с рамки, — внутри здания.
+  const outside = new Set<number>();
+  const stack: number[] = [];
+  const pushEmpty = (cx: number, cy: number) => { if (!inG(cx, cy)) return; const c = k(cx, cy); if (solid0.has(c) || outside.has(c)) return; outside.add(c); stack.push(c); };
+  for (let cx = 0; cx < GW; cx++) { pushEmpty(cx, 0); pushEmpty(cx, GH - 1); }
+  for (let cy = 0; cy < GH; cy++) { pushEmpty(0, cy); pushEmpty(GW - 1, cy); }
+  while (stack.length) { const c = stack.pop()!; const cx = c % GW, cy = (c - cx) / GW; pushEmpty(cx + 1, cy); pushEmpty(cx - 1, cy); pushEmpty(cx, cy + 1); pushEmpty(cx, cy - 1); }
+  const solid = new Set<number>();
+  for (let cy = 0; cy < GH; cy++) for (let cx = 0; cx < GW; cx++) { const c = k(cx, cy); if (solid0.has(c) || !outside.has(c)) solid.add(c); }
+  // граничные рёбра (занято|свободно) → отрезки по углам сетки.
+  const occAt = (cx: number, cy: number) => inG(cx, cy) && solid.has(k(cx, cy));
+  const corner = (gx: number, gy: number): Pt => [minX + (gx - 1) * cell, minY + (gy - 1) * cell];
+  const segs: [Pt, Pt][] = [];
+  for (let cy = 0; cy < GH; cy++) for (let cx = 0; cx < GW; cx++) {
+    if (!solid.has(k(cx, cy))) continue;
+    if (!occAt(cx - 1, cy)) segs.push([corner(cx, cy), corner(cx, cy + 1)]);
+    if (!occAt(cx + 1, cy)) segs.push([corner(cx + 1, cy), corner(cx + 1, cy + 1)]);
+    if (!occAt(cx, cy - 1)) segs.push([corner(cx, cy), corner(cx + 1, cy)]);
+    if (!occAt(cx, cy + 1)) segs.push([corner(cx, cy + 1), corner(cx + 1, cy + 1)]);
+  }
+  const rings = stitchGridEdges(segs).map(simplifyRing).filter((r) => r.length >= 3);
+  if (rings.length === 0) { const h = convexHull(pts); return h.length >= 3 ? [h] : []; }
+  return rings;
+}
+
+/** Сшивает единичные рёбра сетки в замкнутые кольца (по совпадающим узлам). */
+function stitchGridEdges(segs: [Pt, Pt][]): Pt[][] {
+  const key = (p: Pt) => `${Math.round(p[0] * 1000)}_${Math.round(p[1] * 1000)}`;
+  const ek = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+  const pos = new Map<string, Pt>();
+  const adj = new Map<string, string[]>();
+  for (const [a, b] of segs) {
+    const ka = key(a), kb = key(b);
+    if (ka === kb) continue;
+    pos.set(ka, a); pos.set(kb, b);
+    (adj.get(ka) ?? adj.set(ka, []).get(ka)!).push(kb);
+    (adj.get(kb) ?? adj.set(kb, []).get(kb)!).push(ka);
+  }
+  const used = new Set<string>();
+  const rings: Pt[][] = [];
+  for (const startK of pos.keys()) {
+    for (const firstNb of adj.get(startK) || []) {
+      if (used.has(ek(startK, firstNb))) continue;
+      const ring: Pt[] = [pos.get(startK)!];
+      used.add(ek(startK, firstNb));
+      let prev = startK, cur = firstNb, guard = 0;
+      while (cur !== startK && guard++ < pos.size * 4 + 8) {
+        ring.push(pos.get(cur)!);
+        const nbs = adj.get(cur) || [];
+        let nxt = nbs.find((c) => c !== prev && !used.has(ek(cur, c)));
+        if (nxt == null) nxt = nbs.find((c) => !used.has(ek(cur, c)));
+        if (nxt == null) break;
+        used.add(ek(cur, nxt)); prev = cur; cur = nxt;
+      }
+      if (cur === startK && ring.length >= 3) rings.push(ring);
+    }
+  }
+  return rings;
+}
+
+/** Убирает коллинеарные точки кольца (стягивает прямые «лесенки» сетки). */
+function simplifyRing(ring: Pt[]): Pt[] {
+  const n = ring.length;
+  if (n < 4) return ring;
+  const out: Pt[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = ring[(i - 1 + n) % n], b = ring[i], c = ring[(i + 1) % n];
+    if (Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) > 1e-7) out.push(b);
+  }
+  return out.length >= 3 ? out : ring;
+}
+
 /** bbox набора колец [minX,minY,maxX,maxY]. */
 export function bboxOf(rings: Pt[][]): [number, number, number, number] {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -233,8 +346,16 @@ export function bboxOverlap(a: [number, number, number, number], b: [number, num
  *   внешнего контура ХОТЯ БЫ ОДНОГО полигона И не в его дырке. Для центроида/смещения
  *   берётся участок макс. площади.
  * @param toMskCal перевод горизонтальных координат среза FBX в МСК-77 [east,north] с калибровкой.
+ * @param contourRingsModel точный контур основания в осях модели (hA,hB): для меша —
+ *   сшитые кольца среза, для облака — вогнутая оболочка (concaveFootprint). Если задан,
+ *   вердикт по основанию считается ПО КОНТУРУ (а не по облаку точек среза).
  */
-export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: (p: Pt) => Pt): Gis01Result {
+export function runGis01(
+  geom: FbxGeom,
+  parcelPolys: PolyWithHoles[],
+  toMskCal: (p: Pt) => Pt,
+  contourRingsModel: Pt[][] = [],
+): Gis01Result {
   const polys = parcelPolys.filter((p) => p.exterior.length >= 3);
   const parcel =
     polys.slice().sort((a, b) => ringArea(b.exterior) - ringArea(a.exterior))[0] ?? { exterior: [], holes: [] };
@@ -280,6 +401,21 @@ export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: 
       : 0;
   const dist = offsetM >= 1000 ? `${(offsetM / 1000).toFixed(1)} км` : `${offsetM} м`;
 
+  // Точный контур основания в МСК-77 (меш — сшитые кольца, облако — вогнутая оболочка).
+  const contourEN: Pt[][] = contourRingsModel.filter((r) => r.length >= 3).map((r) => r.map(toMskCal));
+  const contourOutsideEN: Pt[] = [];
+  let contourCrosses = false;
+  for (const ring of contourEN) {
+    for (const v of ring) if (!insideAny(v)) contourOutsideEN.push(v);
+    for (const pl of polys) {
+      if (ringsCross(ring, pl.exterior) || pl.holes.some((h) => ringsCross(ring, h))) { contourCrosses = true; break; }
+    }
+  }
+  const hasContour = contourEN.length > 0;
+  const baseOutByContour = hasContour && (contourOutsideEN.length > 0 || contourCrosses);
+  // Свес выше основания — первый уровень ВЫШЕ базового с точками вне ЗУ.
+  const upperExit = levels.find((l) => baseLevel != null && l.hRel > baseLevel.hRel && l.outside > 0) ?? null;
+
   let status: Gis01Result["status"];
   let summary: string;
   let noOverlap = false;
@@ -288,6 +424,20 @@ export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: 
     status = "fail";
     noOverlap = true;
     summary = `Объект ПОЛНОСТЬЮ вне границ ЗУ — нет ни одной точки внутри (центр объекта ~${dist} от центра участка). Вероятна проблема геопривязки/координат.`;
+  } else if (hasContour) {
+    // Вердикт основания — по точному контуру (сохраняет вогнутости/дворы).
+    if (baseOutByContour) {
+      status = "fail";
+      const cross = contourCrosses ? "контур пересекает границу ЗУ" : "";
+      const out = contourOutsideEN.length ? `${contourOutsideEN.length} верш. контура вне ЗУ` : "";
+      summary = `Контур основания выходит за границы ЗУ (${[out, cross].filter(Boolean).join("; ")}).`;
+    } else if (upperExit) {
+      status = "warn";
+      summary = `Основание в границах ЗУ (по точному контуру); с высоты ${upperExit.hRel} м часть выступает за границы (${upperExit.outside} точек).`;
+    } else {
+      status = "pass";
+      summary = `Здание полностью в границах ЗУ — точный контур основания внутри ЗУ (проверено ${levels.length} ур. до ${topRel} м).`;
+    }
   } else if (!exitLevel) {
     status = "pass";
     summary = `Здание полностью в границах ЗУ (проверено ${levels.length} ур. до ${topRel} м).`;
@@ -298,7 +448,7 @@ export function runGis01(geom: FbxGeom, parcelPolys: PolyWithHoles[], toMskCal: 
     status = "warn";
     summary = `Нижняя часть в пределах ЗУ; с высоты ${exitLevel.hRel} м часть выступает за границы ЗУ (${exitLevel.outside} точек).`;
   }
-  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN, parcelHoles: parcel.holes, parcelPolys: polys, noOverlap, offsetM, buildingCentroidEN };
+  return { status, summary, topRel, levels, baseLevel, exitLevel, parcelEN, parcelHoles: parcel.holes, parcelPolys: polys, noOverlap, offsetM, buildingCentroidEN, contourEN, contourOutsideEN };
 }
 
 function centroidOf(ring: Pt[]): Pt | null {
@@ -337,6 +487,7 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
   const polys = res.parcelPolys?.length ? res.parcelPolys : [{ exterior: res.parcelEN, holes: res.parcelHoles || [] }];
   const all: Pt[] = [];
   for (const pl of polys) { all.push(...pl.exterior); for (const h of pl.holes) all.push(...h); }
+  for (const r of res.contourEN || []) all.push(...r);
   if (res.baseLevel) all.push(...res.baseLevel.insideEN, ...res.baseLevel.outsideEN);
   if (res.exitLevel) all.push(...res.exitLevel.insideEN, ...res.exitLevel.outsideEN);
   if (res.buildingCentroidEN) all.push(res.buildingCentroidEN);
@@ -364,6 +515,13 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
     .join("");
   const dots = (pts: Pt[], color: string, r: number) =>
     pts.map((p) => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="${r}" fill="${color}"/>`).join("");
+
+  // Точный контур основания (синим): меш — сшитые кольца, облако — вогнутая оболочка.
+  const hasContour = (res.contourEN?.length ?? 0) > 0;
+  const contourFill = res.status === "fail" ? "#2563eb" : "#1d4ed8";
+  const contourPaths = hasContour
+    ? res.contourEN.map((r) => `<path d="${ringToPath(r)}" fill="${contourFill}" fill-opacity="0.14" stroke="${contourFill}" stroke-width="1.8" stroke-linejoin="round"/>`).join("")
+    : "";
 
   const statusColor = res.status === "pass" ? "#2e7d4f" : res.status === "warn" ? "#b9770e" : "#c0392b";
   const statusText = res.status === "pass" ? "СООТВЕТСТВИЕ" : res.status === "warn" ? "ЧАСТИЧНО (Warning)" : "НЕ СООТВЕТСТВИЕ";
@@ -395,18 +553,20 @@ export function sketchSvg(res: Gis01Result, opts?: { cad?: string; file?: string
   ${opts?.file ? `<text x="${W - pad}" y="22" font-size="11" fill="#555" text-anchor="end">${escXml(opts.file)}</text>` : ""}
   ${opts?.cad ? `<text x="${W - pad}" y="36" font-size="11" fill="#555" text-anchor="end">ЗУ ${escXml(opts.cad)}</text>` : ""}
   ${parcelPaths}
-  ${res.baseLevel ? dots(res.baseLevel.insideEN, "#1f9d55", 1.7) : ""}
+  ${contourPaths}
+  ${hasContour ? "" : res.baseLevel ? dots(res.baseLevel.insideEN, "#1f9d55", 1.7) : ""}
   ${res.exitLevel ? dots(res.exitLevel.insideEN, "#9aa0a6", 1.4) : ""}
   ${res.exitLevel ? dots(res.exitLevel.outsideEN, "#e2241a", 2.4) : ""}
+  ${hasContour ? dots(res.contourOutsideEN || [], "#e2241a", 2.6) : ""}
   ${connector}
   ${diagSvg}
   <g font-size="11" fill="#333">
     <rect x="${pad}" y="${H - 92}" width="14" height="10" fill="#16a34a" fill-opacity="0.25" stroke="#16a34a"/>
     <text x="${pad + 20}" y="${H - 83}">граница ЗУ (ГПЗУ, МСК-77)</text>
-    <circle cx="${pad + 7}" cy="${H - 66}" r="3" fill="#1f9d55"/>
-    <text x="${pad + 20}" y="${H - 62}">срез основания (0 м) — в границах</text>
+    <rect x="${pad}" y="${H - 70}" width="14" height="10" fill="${contourFill}" fill-opacity="0.2" stroke="${contourFill}"/>
+    <text x="${pad + 20}" y="${H - 62}">${hasContour ? "точный контур основания (0 м)" : "срез основания (0 м) — в границах"}</text>
     <circle cx="${pad + 7}" cy="${H - 48}" r="3" fill="#e2241a"/>
-    <text x="${pad + 20}" y="${H - 44}">${res.exitLevel ? `срез ${res.exitLevel.hRel} м — выступает за границы` : "выступов нет"}</text>
+    <text x="${pad + 20}" y="${H - 44}">${hasContour ? (res.contourOutsideEN?.length ? "вершины контура вне ЗУ" : (res.exitLevel ? `свес с ${res.exitLevel.hRel} м` : "выступов нет")) : res.exitLevel ? `срез ${res.exitLevel.hRel} м — выступает за границы` : "выступов нет"}</text>
   </g>
   <line x1="${bx}" y1="${by}" x2="${bx + barLen}" y2="${by}" stroke="#222" stroke-width="2"/>
   <text x="${bx + barLen + 6}" y="${by + 4}" font-size="11" fill="#222">10 м · север ↑</text>
